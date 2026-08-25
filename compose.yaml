@@ -1,0 +1,181 @@
+name: enterprise-rag
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: enterprise_rag
+      POSTGRES_USER: enterprise_rag
+      POSTGRES_PASSWORD: enterprise_rag_dev
+    ports: ["5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    configs:
+      - source: postgres-runtime-role
+        target: /docker-entrypoint-initdb.d/10-runtime-role.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enterprise_rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: enterprise-rag
+      MINIO_ROOT_PASSWORD: enterprise-rag-dev-secret
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio-data:/data"]
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports: ["5672:5672", "15672:15672"]
+    volumes: ["rabbitmq-data:/var/lib/rabbitmq"]
+
+  redis:
+    image: redis:8-alpine
+    command: redis-server --appendonly yes
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+
+  qdrant:
+    image: qdrant/qdrant:v1.15
+    ports: ["6333:6333", "6334:6334"]
+    volumes: ["qdrant-data:/qdrant/storage"]
+
+  opensearch:
+    image: opensearchproject/opensearch:3
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: ["opensearch-data:/usr/share/opensearch/data"]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports: ["8080:8080"]
+    volumes:
+      - ./deploy/keycloak/enterprise-rag-realm.json:/opt/keycloak/data/import/enterprise-rag-realm.json:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: enterprise-rag-api:local
+    env_file:
+      - .env
+    environment:
+      RAG_API_HOST: 0.0.0.0
+      RAG_ENVIRONMENT: staging
+      RAG_DATABASE_URL: postgresql+asyncpg://enterprise_rag_app:enterprise_rag_app_dev@postgres:5432/enterprise_rag
+      RAG_OIDC_ENABLED: "true"
+      RAG_OIDC_ISSUER: http://localhost:8080/realms/enterprise-rag
+      RAG_OIDC_JWKS_URL: http://keycloak:8080/realms/enterprise-rag/protocol/openid-connect/certs
+      RAG_OIDC_AUDIENCE: enterprise-rag
+      RAG_DEV_AUTH_ENABLED: "false"
+      RAG_OBJECT_STORE_BACKEND: s3
+      RAG_S3_ENDPOINT_URL: http://minio:9000
+      RAG_S3_BUCKET: enterprise-rag
+      RAG_QUEUE_BACKEND: rabbitmq
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RAG_CACHE_BACKEND: redis
+      RAG_REDIS_URL: redis://redis:6379/0
+      RAG_VECTOR_BACKEND: qdrant
+      RAG_QDRANT_URL: http://qdrant:6333
+      RAG_LEXICAL_BACKEND: opensearch
+      RAG_OPENSEARCH_URL: http://opensearch:9200
+      RAG_MODEL_BACKEND: extractive
+      RAG_ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000
+      MINIO_ROOT_USER: enterprise-rag
+      MINIO_ROOT_PASSWORD: enterprise-rag-dev-secret
+    command:
+      ["sh", "-c", "RAG_DATABASE_URL=postgresql+asyncpg://enterprise_rag:enterprise_rag_dev@postgres:5432/enterprise_rag .venv/bin/alembic upgrade head && exec .venv/bin/uvicorn enterprise_rag.main:app --app-dir backend --host 0.0.0.0 --port 8000 --no-access-log"]
+    ports: ["127.0.0.1:8101:8000"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      opensearch:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      default:
+        aliases:
+          - enterprise-rag-api
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: enterprise-rag-worker:local
+    env_file:
+      - .env
+    environment:
+      RAG_ENVIRONMENT: staging
+      RAG_DATABASE_URL: postgresql+asyncpg://enterprise_rag_app:enterprise_rag_app_dev@postgres:5432/enterprise_rag
+      RAG_OIDC_ENABLED: "true"
+      RAG_OIDC_ISSUER: http://localhost:8080/realms/enterprise-rag
+      RAG_OIDC_JWKS_URL: http://keycloak:8080/realms/enterprise-rag/protocol/openid-connect/certs
+      RAG_OIDC_AUDIENCE: enterprise-rag
+      RAG_DEV_AUTH_ENABLED: "false"
+      RAG_OBJECT_STORE_BACKEND: s3
+      RAG_S3_ENDPOINT_URL: http://minio:9000
+      RAG_S3_BUCKET: enterprise-rag
+      RAG_QUEUE_BACKEND: rabbitmq
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RAG_CACHE_BACKEND: redis
+      RAG_REDIS_URL: redis://redis:6379/0
+      RAG_VECTOR_BACKEND: qdrant
+      RAG_QDRANT_URL: http://qdrant:6333
+      RAG_LEXICAL_BACKEND: opensearch
+      RAG_OPENSEARCH_URL: http://opensearch:9200
+      RAG_MODEL_BACKEND: extractive
+      MINIO_ROOT_USER: enterprise-rag
+      MINIO_ROOT_PASSWORD: enterprise-rag-dev-secret
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: enterprise-rag-web:local
+    ports: ["3000:8080"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  minio-data:
+  rabbitmq-data:
+  redis-data:
+  qdrant-data:
+  opensearch-data:
+
+configs:
+  postgres-runtime-role:
+    file: ./deploy/postgres/init-runtime-role.sql

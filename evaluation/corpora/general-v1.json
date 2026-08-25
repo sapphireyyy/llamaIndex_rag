@@ -1,0 +1,19 @@
+{
+  "id": "general-enterprise-v1",
+  "version": 1,
+  "domains": ["policy", "it-help", "product"],
+  "items": [
+    {"id": "policy-answerable", "domain": "policy", "case": "answerable", "question": "How many leave days are available?", "expected_source_scope": ["policy-handbook"], "reference_answer": "Employees receive 20 leave days.", "expected_answerability": true, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "policy-unanswerable", "domain": "policy", "case": "unanswerable", "question": "What is tomorrow's cafeteria menu?", "expected_source_scope": [], "expected_answerability": false, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "policy-conflict", "domain": "policy", "case": "conflicting", "question": "What is the travel limit?", "expected_source_scope": ["policy-current", "policy-legacy"], "expected_answerability": true, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "policy-permission", "domain": "policy", "case": "permission-sensitive", "question": "What is the executive bonus policy?", "expected_source_scope": [], "expected_answerability": false, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "it-multiturn", "domain": "it-help", "case": "multi-turn", "question": "What does VPN access require?", "expected_source_scope": ["it-vpn"], "reference_answer": "Manager approval and MFA.", "expected_answerability": true, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "it-update", "domain": "it-help", "case": "source-update", "question": "Which MFA version is current?", "expected_source_scope": ["it-mfa-current"], "expected_answerability": true, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "it-deletion", "domain": "it-help", "case": "source-deletion", "question": "What did the deleted runbook say?", "expected_source_scope": [], "expected_answerability": false, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "it-mixed-language", "domain": "it-help", "case": "mixed-language", "question": "VPN 需要谁审批 approval?", "expected_source_scope": ["it-vpn"], "expected_answerability": true, "access_context": {"groups": ["employees"], "roles": ["reader"]}},
+    {"id": "product-answerable", "domain": "product", "case": "answerable", "question": "Does Aurora support SSO?", "expected_source_scope": ["product-aurora"], "reference_answer": "Aurora supports SSO.", "expected_answerability": true, "access_context": {"groups": ["customers"], "roles": ["reader"]}},
+    {"id": "product-paraphrase", "domain": "product", "case": "semantic-paraphrase", "question": "Can Aurora use centralized sign-in?", "expected_source_scope": ["product-aurora"], "expected_answerability": true, "access_context": {"groups": ["customers"], "roles": ["reader"]}},
+    {"id": "product-exact-term", "domain": "product", "case": "exact-term", "question": "What is SKU AUR-ENT-01?", "expected_source_scope": ["product-aurora"], "expected_answerability": true, "access_context": {"groups": ["customers"], "roles": ["reader"]}},
+    {"id": "product-revocation", "domain": "product", "case": "mid-session-revocation", "question": "Can I still read the restricted roadmap?", "expected_source_scope": [], "expected_answerability": false, "access_context": {"groups": ["customers"], "roles": ["reader"]}}
+  ]
+}

@@ -1,0 +1,86 @@
+[project]
+name = "enterprise-rag-assistant"
+version = "0.1.0"
+description = "Permission-aware enterprise knowledge assistant built with FastAPI and LlamaIndex."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "alembic>=1.16,<2",
+  "boto3>=1.40,<2",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "llama-index-core>=0.13,<1",
+  "opentelemetry-api>=1.36,<2",
+  "opentelemetry-sdk>=1.36,<2",
+  "prometheus-client>=0.22,<1",
+  "pydantic-settings>=2.10,<3",
+  "pyjwt[crypto]>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy[asyncio]>=2.0.40,<3",
+  "structlog>=25.4,<26",
+  "tzdata>=2025.2",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.30,<1"]
+parsers = [
+  "beautifulsoup4>=4.13,<5",
+  "openpyxl>=3.1,<4",
+  "pymupdf>=1.26,<2",
+  "python-docx>=1.2,<2",
+  "python-pptx>=1.0,<2",
+]
+providers = [
+  "aio-pika>=9.5,<10",
+  "llama-index-embeddings-openai>=0.5,<1",
+  "llama-index-llms-openai-like>=0.5,<1",
+  "opensearch-py>=3,<4",
+  "qdrant-client>=1.15,<2",
+  "redis>=6,<7",
+]
+
+[project.scripts]
+enterprise-rag-bootstrap = "enterprise_rag.cli.bootstrap_tenants:main"
+
+[dependency-groups]
+dev = [
+  "aiosqlite>=0.21,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<7",
+  "respx>=0.22,<1",
+  "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/enterprise_rag"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["backend"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".uv-cache", "web/node_modules", "web/dist", "graphify-out"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002"]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/versions/*.py" = ["E501", "I001", "UP007", "UP035"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["enterprise_rag"]
+mypy_path = "backend"

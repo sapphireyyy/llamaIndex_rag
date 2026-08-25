@@ -1,0 +1,28 @@
+groups:
+  - name: enterprise-rag
+    rules:
+      - alert: EnterpriseRagApiErrorRate
+        expr: sum(rate(enterprise_rag_requests_total{status=~"5.."}[5m])) / sum(rate(enterprise_rag_requests_total[5m])) > 0.05
+        for: 10m
+        labels: {severity: page}
+        annotations: {summary: "Enterprise RAG API error rate exceeds 5%"}
+      - alert: EnterpriseRagQueryFailure
+        expr: sum(rate(enterprise_rag_query_outcomes_total{status="failed"}[5m])) > 0.05
+        for: 10m
+        labels: {severity: page}
+        annotations: {summary: "Enterprise RAG query failures increased"}
+      - alert: EnterpriseRagIngestionFailure
+        expr: sum(rate(enterprise_rag_ingestion_outcomes_total{status="failed"}[10m])) / sum(rate(enterprise_rag_ingestion_outcomes_total[10m])) > 0.1
+        for: 15m
+        labels: {severity: page}
+        annotations: {summary: "Enterprise RAG ingestion failure exceeds 10%"}
+      - alert: EnterpriseRagQueueBacklog
+        expr: enterprise_rag_queue_backlog > 1000
+        for: 10m
+        labels: {severity: page}
+        annotations: {summary: "Enterprise RAG queue backlog is high"}
+      - alert: EnterpriseRagProviderCostSpike
+        expr: increase(enterprise_rag_provider_cost_total[1h]) > 100
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Enterprise RAG provider cost spike"}

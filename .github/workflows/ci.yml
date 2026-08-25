@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - run: uv run ruff check .
+      - run: uv run mypy backend
+      - run: uv run pytest --cov=enterprise_rag --cov-report=term-missing
+      - run: uv run alembic upgrade head
+        env:
+          RAG_DATABASE_URL: sqlite+aiosqlite:///./ci.db
+      - run: uv run alembic downgrade base
+        env:
+          RAG_DATABASE_URL: sqlite+aiosqlite:///./ci.db
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run check
+
+  openspec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx --yes @fission-ai/openspec validate build-general-enterprise-rag-assistant --type change --strict --no-interactive
+

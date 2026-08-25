@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: enterprise-rag
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enterprise-rag-config
+  namespace: enterprise-rag
+data:
+  RAG_ENVIRONMENT: production
+  RAG_DEV_AUTH_ENABLED: "false"
+  RAG_OIDC_ENABLED: "true"
+  RAG_OIDC_AUDIENCE: enterprise-rag
+  RAG_OBJECT_STORE_BACKEND: s3
+  RAG_QUEUE_BACKEND: rabbitmq
+  RAG_VECTOR_BACKEND: qdrant
+  RAG_LEXICAL_BACKEND: opensearch
+  RAG_CONTENT_CAPTURE_ENABLED: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enterprise-rag-api
+  namespace: enterprise-rag
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: enterprise-rag-api}}
+  template:
+    metadata: {labels: {app: enterprise-rag-api}}
+    spec:
+      serviceAccountName: enterprise-rag
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: api
+          image: enterprise-rag-api:0.1.0
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: enterprise-rag-config}
+            - secretRef: {name: enterprise-rag-runtime}
+          readinessProbe: {httpGet: {path: /health/ready, port: 8000}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /health/live, port: 8000}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsUser: 65532
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enterprise-rag-worker
+  namespace: enterprise-rag
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: enterprise-rag-worker}}
+  template:
+    metadata: {labels: {app: enterprise-rag-worker}}
+    spec:
+      serviceAccountName: enterprise-rag
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: worker
+          image: enterprise-rag-worker:0.1.0
+          envFrom:
+            - configMapRef: {name: enterprise-rag-config}
+            - secretRef: {name: enterprise-rag-runtime}
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "4", memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsUser: 65532
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: enterprise-rag, namespace: enterprise-rag}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata: {name: enterprise-rag-api, namespace: enterprise-rag}
+spec:
+  selector: {app: enterprise-rag-api}
+  ports: [{port: 8000, targetPort: 8000}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: enterprise-rag-api, namespace: enterprise-rag}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: enterprise-rag-api}
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: enterprise-rag-api, namespace: enterprise-rag}
+spec: {minAvailable: 2, selector: {matchLabels: {app: enterprise-rag-api}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: enterprise-rag}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-api, namespace: enterprise-rag}
+spec:
+  podSelector: {matchLabels: {app: enterprise-rag-api}}
+  policyTypes: [Ingress, Egress]
+  ingress: [{ports: [{protocol: TCP, port: 8000}]}]
+  egress:
+    - ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 5432}
+        - {protocol: TCP, port: 5672}
+        - {protocol: TCP, port: 6333}
+        - {protocol: TCP, port: 9200}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: enterprise-rag-backup-check, namespace: enterprise-rag}
+spec:
+  schedule: "17 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: verify
+              image: enterprise-rag-ops:0.1.0
+              args: ["verify-backup-and-object-inventory"]
+              envFrom: [{secretRef: {name: enterprise-rag-runtime}}]
