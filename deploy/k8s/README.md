@@ -5,6 +5,11 @@ commit values. Required keys are `RAG_DATABASE_URL`, OIDC issuer/JWKS values, ob
 queue, vector, lexical, and model secret references. Apply migrations as a one-shot release
 job before rolling the API and worker Deployments.
 
+Replace the `sso.example.invalid` and `rag.example.invalid` Web public OIDC placeholders before
+deployment. These browser-visible values must never contain a client secret, test password,
+access token, or refresh token. Register the exact public origin, callback, silent-check callback,
+and post-logout URI in Keycloak before rolling the Web Deployment.
+
 Provider data services must enable encryption, point-in-time recovery, multi-zone replicas,
 private endpoints, and daily restore verification. Retain database and object-store backups
 for the tenant contract period. Recovery order is database, object store, indexes rebuilt

@@ -5,10 +5,9 @@ import uuid
 
 import httpx
 import pytest
-from enterprise_rag.api.auth import verify_oidc_token
 from enterprise_rag.application.ports import IndexDocument
 from enterprise_rag.config import Settings
-from enterprise_rag.domain.types import AuthorizationScope, JobMessage, PlatformRole
+from enterprise_rag.domain.types import AuthorizationScope, JobMessage
 from enterprise_rag.infrastructure.container import Container
 from enterprise_rag.infrastructure.object_store import S3ObjectStore, tenant_object_key
 from enterprise_rag.infrastructure.queue import RabbitMQQueue
@@ -28,35 +27,19 @@ def _name(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
-async def test_keycloak_issues_verifiable_tenant_and_role_claims() -> None:
+async def test_keycloak_public_browser_client_rejects_password_grant() -> None:
     async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
         response = await client.post(
             "http://localhost:8080/realms/enterprise-rag/protocol/openid-connect/token",
             data={
                 "grant_type": "password",
                 "client_id": "enterprise-rag",
-                "username": "rag-admin",
-                "password": "rag-admin-dev",
+                "username": "acceptance-probe",
+                "password": "acceptance-probe",
             },
         )
-    response.raise_for_status()
-    identity = verify_oidc_token(
-        response.json()["access_token"],
-        Settings(
-            environment="staging",
-            oidc_enabled=True,
-            oidc_issuer="http://localhost:8080/realms/enterprise-rag",
-            oidc_jwks_url=(
-                "http://localhost:8080/realms/enterprise-rag/"
-                "protocol/openid-connect/certs"
-            ),
-            oidc_audience="enterprise-rag",
-            dev_auth_enabled=False,
-        ),
-    )
-    assert identity.tenant_hint == "tenant-alpha"
-    assert "platform-administrators" in identity.groups
-    assert identity.platform_roles == frozenset({PlatformRole.PLATFORM_ADMINISTRATOR})
+    assert response.status_code == 400
+    assert response.json()["error"] == "unauthorized_client"
 
 
 async def test_minio_round_trip_uses_tenant_scoped_key() -> None:

@@ -37,25 +37,23 @@ def parse_sse(body: str) -> list[tuple[str, dict[str, Any]]]:
     return events
 
 
+def _injected_access_token() -> str:
+    """Return a short-lived browser-flow token without handling user credentials."""
+    token = os.getenv("RAG_SMOKE_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "RAG_SMOKE_ACCESS_TOKEN is required; obtain a short-lived token through "
+            "the standard browser login flow because the public client disables password grants"
+        )
+    return token
+
+
 def _legacy_main() -> None:
     base_url = os.getenv("RAG_SMOKE_BASE_URL", "http://127.0.0.1:8000")
-    keycloak_url = os.getenv(
-        "RAG_SMOKE_KEYCLOAK_URL",
-        "http://localhost:8080/realms/enterprise-rag",
-    )
     suffix = uuid.uuid4().hex[:12]
 
     with httpx.Client(timeout=90.0, trust_env=False) as client:
-        token_response = client.post(
-            f"{keycloak_url}/protocol/openid-connect/token",
-            data={
-                "grant_type": "password",
-                "client_id": "enterprise-rag",
-                "username": os.getenv("RAG_SMOKE_USERNAME", "rag-admin"),
-                "password": os.getenv("RAG_SMOKE_PASSWORD", "rag-admin-dev"),
-            },
-        )
-        token = require(token_response, 200)["access_token"]
+        token = _injected_access_token()
         headers = {
             "Authorization": f"Bearer {token}",
             "X-Correlation-ID": f"production-smoke-{suffix}",
@@ -209,21 +207,9 @@ def _subject_id(token: str) -> str:
 def main() -> None:
     """Exercise the production multi-tenant control and data planes end to end."""
     base_url = os.getenv("RAG_SMOKE_BASE_URL", "http://127.0.0.1:8000")
-    keycloak_url = os.getenv(
-        "RAG_SMOKE_KEYCLOAK_URL", "http://localhost:8080/realms/enterprise-rag"
-    )
     suffix = uuid.uuid4().hex[:12]
     with httpx.Client(timeout=90.0, trust_env=False) as client:
-        token_response = client.post(
-            f"{keycloak_url}/protocol/openid-connect/token",
-            data={
-                "grant_type": "password",
-                "client_id": "enterprise-rag",
-                "username": os.getenv("RAG_SMOKE_USERNAME", "rag-admin"),
-                "password": os.getenv("RAG_SMOKE_PASSWORD", "rag-admin-dev"),
-            },
-        )
-        token = str(require(token_response, 200)["access_token"])
+        token = _injected_access_token()
         subject_id = _subject_id(token)
         platform_headers = {
             "Authorization": f"Bearer {token}",

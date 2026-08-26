@@ -134,7 +134,7 @@ services:
       RAG_LEXICAL_BACKEND: opensearch
       RAG_OPENSEARCH_URL: http://opensearch:9200
       RAG_MODEL_BACKEND: extractive
-      RAG_ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000
+      RAG_ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000,http://localhost:5173
       MINIO_ROOT_USER: enterprise-rag
       MINIO_ROOT_PASSWORD: enterprise-rag-dev-secret
     command:
@@ -207,6 +207,17 @@ services:
       context: ./web
       dockerfile: Dockerfile
     image: enterprise-rag-web:local
+    environment:
+      WEB_APP_ENVIRONMENT: staging
+      WEB_AUTH_MODE: oidc
+      WEB_OIDC_URL: http://localhost:8080
+      WEB_OIDC_REALM: enterprise-rag
+      WEB_OIDC_CLIENT_ID: enterprise-rag
+      WEB_OIDC_REDIRECT_URI: http://localhost:3000/
+      WEB_OIDC_POST_LOGOUT_REDIRECT_URI: http://localhost:3000/
+      WEB_OIDC_SILENT_CHECK_SSO_REDIRECT_URI: http://localhost:3000/silent-check-sso.html
+      WEB_OIDC_SCOPES: profile,email
+      WEB_OIDC_MIN_VALIDITY_SECONDS: "30"
     ports: ["3000:8080"]
     depends_on:
       api:

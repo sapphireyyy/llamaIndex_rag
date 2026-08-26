@@ -32,6 +32,11 @@ main { min-width: 0; }
 .topbar { min-height: 116px; padding: 27px 38px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #dde3da; background: #f8faf6cc; backdrop-filter: blur(14px); }
 .topbar h1 { margin: 0; font-family: Georgia, "Noto Serif SC", serif; font-size: 27px; font-weight: 600; color: #163025; }
 .topbar p { margin: 7px 0 0; color: #718078; font-size: 13px; }
+.topbar-actions { display: flex; align-items: center; gap: 14px; }
+.identity-chip { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 3px 9px; align-items: center; padding: 8px 10px; border: 1px solid #d5dfd3; border-radius: 9px; background: #f4f7f1; }
+.identity-chip span { color: #829087; font-size: 9px; text-transform: uppercase; }
+.identity-chip strong { max-width: 180px; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.identity-chip button { grid-column: 2; grid-row: 1 / 3; }
 .tenant-chip { background: #e6ece3; border: 1px solid #d5dfd3; padding: 9px 13px; border-radius: 9px; min-width: 130px; }
 .tenant-chip span, .tenant-chip strong { display: block; }
 .tenant-chip span { color: #829087; font-size: 10px; text-transform: uppercase; }
@@ -170,6 +175,14 @@ td { padding: 11px 10px; border-bottom: 1px solid #eef1ed; }
 .tenant-state-card p { color: #718078; line-height: 1.7; }
 .tenant-state-card .primary { margin-top: 10px; }
 .empty-state { padding: 44px; color: #718078; text-align: center; }
+.auth-page { min-height: 100vh; padding: 28px; display: grid; place-items: center; background: radial-gradient(circle at top, #edf4e9, #f1f4ef 55%); }
+.auth-card { width: min(480px, 100%); padding: 42px; border: 1px solid #d8e2d6; border-radius: 18px; background: #fff; box-shadow: 0 20px 70px #18312318; }
+.auth-card h1 { margin: 9px 0 12px; color: #173327; font: 600 28px/1.25 Georgia, "Noto Serif SC", serif; }
+.auth-card p { color: #6f7f76; line-height: 1.75; }
+.auth-kicker { color: #4d765f; font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.auth-actions { display: flex; gap: 9px; margin-top: 24px; }
+.auth-login { margin-top: 20px; padding: 11px 17px; }
+.auth-health { margin: 24px 0 0 !important; padding-top: 16px; border-top: 1px solid #e6ebe4; font-size: 11px; }
 
 @media (max-width: 1250px) {
   .workspace { padding-left: 24px; padding-right: 24px; }
@@ -184,6 +197,7 @@ td { padding: 11px 10px; border-bottom: 1px solid #eef1ed; }
   .sidebar nav button { padding: 9px 11px; }
   .system-status { display: none; }
   .topbar { min-height: 0; padding: 18px 20px; align-items: flex-start; gap: 18px; }
+  .topbar-actions { align-items: stretch; flex-direction: column; }
   .topbar > div:first-child p { display: none; }
   .workspace { padding: 18px; }
   .page-grid, .quality-grid, .admin-two-column { grid-template-columns: 1fr; }

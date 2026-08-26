@@ -1,0 +1,12 @@
+window.__ENTERPRISE_RAG_CONFIG__ = Object.freeze({
+  environment: "${WEB_APP_ENVIRONMENT}",
+  authMode: "${WEB_AUTH_MODE}",
+  oidcUrl: "${WEB_OIDC_URL}",
+  realm: "${WEB_OIDC_REALM}",
+  clientId: "${WEB_OIDC_CLIENT_ID}",
+  redirectUri: "${WEB_OIDC_REDIRECT_URI}",
+  postLogoutRedirectUri: "${WEB_OIDC_POST_LOGOUT_REDIRECT_URI}",
+  silentCheckSsoRedirectUri: "${WEB_OIDC_SILENT_CHECK_SSO_REDIRECT_URI}",
+  scopes: "${WEB_OIDC_SCOPES}",
+  minTokenValiditySeconds: ${WEB_OIDC_MIN_VALIDITY_SECONDS},
+});

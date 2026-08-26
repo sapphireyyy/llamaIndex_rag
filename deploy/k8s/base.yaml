@@ -20,6 +20,16 @@ data:
   RAG_MILVUS_COLLECTION: enterprise_rag_chunks
   RAG_LEXICAL_BACKEND: opensearch
   RAG_CONTENT_CAPTURE_ENABLED: "false"
+  WEB_APP_ENVIRONMENT: production
+  WEB_AUTH_MODE: oidc
+  WEB_OIDC_URL: https://sso.example.invalid
+  WEB_OIDC_REALM: enterprise-rag
+  WEB_OIDC_CLIENT_ID: enterprise-rag
+  WEB_OIDC_REDIRECT_URI: https://rag.example.invalid/
+  WEB_OIDC_POST_LOGOUT_REDIRECT_URI: https://rag.example.invalid/
+  WEB_OIDC_SILENT_CHECK_SSO_REDIRECT_URI: https://rag.example.invalid/silent-check-sso.html
+  WEB_OIDC_SCOPES: profile,email
+  WEB_OIDC_MIN_VALIDITY_SECONDS: "30"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -93,6 +103,44 @@ metadata: {name: enterprise-rag-api, namespace: enterprise-rag}
 spec:
   selector: {app: enterprise-rag-api}
   ports: [{port: 8000, targetPort: 8000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enterprise-rag-web
+  namespace: enterprise-rag
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: enterprise-rag-web}}
+  template:
+    metadata: {labels: {app: enterprise-rag-web}}
+    spec:
+      serviceAccountName: enterprise-rag
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: web
+          image: enterprise-rag-web:0.1.0
+          ports: [{containerPort: 8080}]
+          envFrom: [{configMapRef: {name: enterprise-rag-config}}]
+          readinessProbe: {httpGet: {path: /health/live, port: 8080}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /health/live, port: 8080}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsUser: 101
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: enterprise-rag-web, namespace: enterprise-rag}
+spec:
+  selector: {app: enterprise-rag-web}
+  ports: [{port: 80, targetPort: 8080}]
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

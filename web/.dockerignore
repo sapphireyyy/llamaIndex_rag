@@ -1,3 +1,6 @@
 node_modules
 dist
 *.tsbuildinfo
+.playwright-output
+e2e
+playwright.config.ts

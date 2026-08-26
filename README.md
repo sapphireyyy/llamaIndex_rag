@@ -13,6 +13,10 @@
 6. Windows 环境中，使用 `npm.cmd --prefix web install` 安装前端依赖，再使用
    `npm.cmd --prefix web run dev` 启动前端。
 
+Vite 开发页面默认位于 <http://localhost:5173>；Docker Compose 页面位于
+<http://localhost:3000>，并通过 Keycloak Authorization Code + PKCE 登录。前端只接收公开
+OIDC 配置，不配置客户端密钥。
+
 默认开发配置使用 SQLite 和进程内适配器，因此运行测试与基础本地体验无需准备外部凭证。
 `compose.yaml` 提供了用于集成测试和生产近似验证的企业级依赖基线。
 
@@ -22,6 +26,9 @@
 - 代码规范：`uv run ruff check .`
 - 类型检查：`uv run mypy backend`
 - 前端检查：`npm.cmd --prefix web run check`
+- 前端测试：`npm.cmd --prefix web test`
+- Keycloak 浏览器验收：通过秘密环境变量提供两个测试主体后运行
+  `npm.cmd --prefix web run test:e2e:keycloak`
 - OpenSpec 校验：`openspec validate build-general-enterprise-rag-assistant --type change --strict`
 
 更多架构决策、运维说明和使用流程见 `docs/`。

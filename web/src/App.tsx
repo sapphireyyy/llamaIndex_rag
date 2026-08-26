@@ -1,6 +1,8 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   api,
+  rememberedTenantForSubject,
+  rememberTenantForSubject,
   setTenantBoundary,
   streamQuery,
   type Assistant,
@@ -16,6 +18,7 @@ import {
   type TenantContext,
   type TenantSummary,
 } from "./api";
+import { useAuth } from "./auth-context";
 import TenantAdministration from "./TenantAdministration";
 import "./styles.css";
 
@@ -144,9 +147,9 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
         <section className="panel">
           <div className="panel-title"><div><h2>文档与摄取</h2><p>先暂存并验证双索引，成功后才切换活动版本。</p></div><label className="upload-button">上传文档<input type="file" onChange={(event) => void upload(event.target.files?.[0])} /></label></div>
           <div className="table-wrap"><table><thead><tr><th>文档</th><th>状态</th><th>活动版本</th><th>操作</th></tr></thead><tbody>
-            {documents.filter((item) => !selected || item.knowledge_space_id === selected).map((item) => <tr key={item.id}><td>{item.title}</td><td><StatusPill value={item.state} /></td><td className="mono">{item.active_version_id?.slice(-10) ?? "—"}</td><td className="actions"><button onClick={() => void showPreview(item)}>版本与预览</button><button className="danger" onClick={() => void api.deleteDocument(item.id).then(refresh)}>删除</button></td></tr>)}
+            {documents.filter((item) => !selected || item.knowledge_space_id === selected).map((item) => <tr key={item.id}><td>{item.title}</td><td><StatusPill value={item.state} /></td><td className="mono">{item.active_version_id?.slice(-10) ?? "—"}</td><td className="actions"><button onClick={() => void showPreview(item)}>版本与预览</button><button onClick={() => void api.downloadDocument(item.id, item.title)}>下载</button><button className="danger" onClick={() => void api.deleteDocument(item.id).then(refresh)}>删除</button></td></tr>)}
           </tbody></table></div>
-          {preview && <div className="preview"><button className="close" onClick={() => setPreview("")}>×</button><pre>{preview}</pre></div>}
+          {preview && <div className="preview"><button className="close" aria-label="关闭文档预览" onClick={() => setPreview("")}>×</button><pre>{preview}</pre></div>}
         </section>
         <section className="panel compact"><div className="panel-title"><h2>最近任务</h2></div><div className="job-grid">{jobs.slice(0, 6).map((job) => <div className="job-card" key={job.id}><StatusPill value={job.status} /><strong>{job.stage}</strong><small>尝试 {job.attempt_count}/{job.max_attempts ?? 3}</small>{job.error_message && <p>{job.error_message}</p>}{job.status === "failed" && <button onClick={() => void api.retryJob(job.id).then(refresh)}>重试</button>}{["queued", "running"].includes(job.status) && <button onClick={() => void api.cancelJob(job.id).then(refresh)}>取消</button>}</div>)}</div></section>
       </div>
@@ -215,7 +218,7 @@ function ChatView({ notify }: { notify: (notice: Notice) => void }) {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState(false);
-  const [sourcePreview, setSourcePreview] = useState("");
+  const [sourcePreview, setSourcePreview] = useState<{ text: string; downloadUrl: string; title: string } | null>(null);
   useEffect(() => { void api.assistants().then((result) => { setAssistants(result.items); setAssistantId(result.items[0]?.id ?? ""); }); }, []);
 
   async function ask(event: FormEvent) {
@@ -236,10 +239,14 @@ function ChatView({ notify }: { notify: (notice: Notice) => void }) {
   async function openCitation(citation: Citation) {
     const source = await api.source(citation.source_url);
     const preview = await api.previewDocument(source.document_id);
-    setSourcePreview(`${source.title}${source.page ? ` · 第 ${source.page} 页` : ""}\n\n${preview.items.map((item) => item.text).join("\n\n")}`);
+    setSourcePreview({
+      title: source.title,
+      downloadUrl: source.download_url,
+      text: `${source.title}${source.page ? ` · 第 ${source.page} 页` : ""}\n\n${preview.items.map((item) => item.text).join("\n\n")}`,
+    });
   }
 
-  return <div className="chat-layout"><section className="chat-panel"><div className="chat-toolbar"><select value={assistantId} onChange={(event) => { setAssistantId(event.target.value); setConversationId(null); setMessages([]); }}>{assistants.map((assistant) => <option key={assistant.id} value={assistant.id}>{assistant.name}</option>)}</select><span>{conversationId ? "连续对话 · 每轮重新授权检索" : "新对话"}</span></div><div className="messages">{messages.length === 0 && <div className="welcome"><div className="welcome-icon">⌁</div><h2>从授权知识中获得可追溯答案</h2><p>答案没有足够证据时会明确拒答；来源冲突时会并列展示。</p></div>}{messages.map((message, index) => <article className={`message ${message.role}`} key={index}><div className="avatar">{message.role === "user" ? "你" : "AI"}</div><div className="bubble"><p>{message.text || (streaming ? "正在检索与核验…" : "")}</p>{message.status && <StatusPill value={message.status} />}<div className="citations">{message.citations?.map((citation) => <button key={citation.id} onClick={() => void openCitation(citation)}>{citation.label}{citation.page ? ` · p.${citation.page}` : ""}</button>)}</div></div></article>)}</div><form className="composer" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="询问企业政策、IT 帮助或产品资料…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><button className="primary" disabled={streaming || !assistantId}>{streaming ? "生成中" : "发送"}</button></form>{answerId && <div className="feedback-bar">这个答案有帮助吗？<button onClick={() => void api.feedback(answerId, 5, "helpful").then(() => notify({ tone: "ok", text: "反馈已记录" }))}>有帮助</button><button onClick={() => void api.feedback(answerId, 1, "needs improvement").then(() => notify({ tone: "ok", text: "反馈已记录" }))}>需改进</button></div>}</section>{sourcePreview && <aside className="source-drawer"><button className="close" onClick={() => setSourcePreview("")}>×</button><pre>{sourcePreview}</pre></aside>}</div>;
+  return <div className="chat-layout"><section className="chat-panel"><div className="chat-toolbar"><select value={assistantId} onChange={(event) => { setAssistantId(event.target.value); setConversationId(null); setMessages([]); }}>{assistants.map((assistant) => <option key={assistant.id} value={assistant.id}>{assistant.name}</option>)}</select><span>{conversationId ? "连续对话 · 每轮重新授权检索" : "新对话"}</span></div><div className="messages">{messages.length === 0 && <div className="welcome"><div className="welcome-icon">⌁</div><h2>从授权知识中获得可追溯答案</h2><p>答案没有足够证据时会明确拒答；来源冲突时会并列展示。</p></div>}{messages.map((message, index) => <article className={`message ${message.role}`} key={index}><div className="avatar">{message.role === "user" ? "你" : "AI"}</div><div className="bubble"><p>{message.text || (streaming ? "正在检索与核验…" : "")}</p>{message.status && <StatusPill value={message.status} />}<div className="citations">{message.citations?.map((citation) => <button key={citation.id} onClick={() => void openCitation(citation)}>{citation.label}{citation.page ? ` · p.${citation.page}` : ""}</button>)}</div></div></article>)}</div><form className="composer" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="询问企业政策、IT 帮助或产品资料…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><button className="primary" disabled={streaming || !assistantId}>{streaming ? "生成中" : "发送"}</button></form>{answerId && <div className="feedback-bar">这个答案有帮助吗？<button onClick={() => void api.feedback(answerId, 5, "helpful").then(() => notify({ tone: "ok", text: "反馈已记录" }))}>有帮助</button><button onClick={() => void api.feedback(answerId, 1, "needs improvement").then(() => notify({ tone: "ok", text: "反馈已记录" }))}>需改进</button></div>}</section>{sourcePreview && <aside className="source-drawer"><button className="close" aria-label="关闭来源预览" onClick={() => setSourcePreview(null)}>×</button><button onClick={() => void api.downloadSource(sourcePreview.downloadUrl, sourcePreview.title)}>认证下载原文</button><pre>{sourcePreview.text}</pre></aside>}</div>;
 }
 
 function QualityView({ notify }: { notify: (notice: Notice) => void }) {
@@ -275,6 +282,8 @@ export function LegacyApp() {
 }
 
 export default function App() {
+  const { snapshot, logout } = useAuth();
+  const subject = snapshot.subject!;
   const [view, setView] = useState<View>("chat");
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
@@ -291,7 +300,7 @@ export default function App() {
   const selectTenant = useCallback(async (tenantId: string, available: TenantSummary[]) => {
     setTenantBoundary(tenantId);
     setSelectedTenantId(tenantId);
-    window.localStorage.setItem("enterprise-rag.selected-tenant", tenantId);
+    await rememberTenantForSubject(subject, tenantId);
     setTenantContext(null);
     setTenantGeneration((current) => current + 1);
     const tenant = available.find((item) => item.id === tenantId);
@@ -299,18 +308,18 @@ export default function App() {
       try { setTenantContext(await api.tenantContext()); }
       catch (error) { notify({ tone: "error", text: (error as Error).message }); }
     }
-  }, [notify]);
+  }, [notify, subject]);
 
   const refreshDiscovery = useCallback(async () => {
     const result = await api.discoverTenants();
     setTenants(result.items);
     setPlatformRoles(result.platform_roles);
-    const remembered = window.localStorage.getItem("enterprise-rag.selected-tenant") ?? "";
+    const remembered = await rememberedTenantForSubject(subject);
     const next = result.items.some((item) => item.id === remembered)
       ? remembered
       : result.items.find((item) => item.state === "active")?.id ?? result.items[0]?.id ?? "";
     await selectTenant(next, result.items);
-  }, [selectTenant]);
+  }, [selectTenant, subject]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -347,7 +356,7 @@ export default function App() {
       <nav>{navItems.filter(([, , , visible]) => visible).map(([key, label, icon]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)}><span>{icon}</span>{label}</button>)}</nav>
       <div className={`system-status ${health?.ready ? "ready" : "degraded"}`}><i /><div><strong>{health?.ready ? "系统就绪" : "系统受限"}</strong><small>{health ? `API ${health.version}` : "正在连接服务"}</small></div></div>
     </aside>
-    <main><header className="topbar"><div><h1>{titles[view][0]}</h1><p>{titles[view][1]}</p></div><div className="tenant-switcher"><label htmlFor="tenant-selector">当前租户</label><select id="tenant-selector" value={selectedTenantId} onChange={(event) => void selectTenant(event.target.value, tenants)} disabled={tenants.length === 0}><option value="">{tenants.length ? "请选择租户" : "无可用租户"}</option>{tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name} · {tenant.state}</option>)}</select>{selectedTenant && <div><StatusPill value={selectedTenant.state} /><span>{tenantContext?.roles.join(" / ") ?? selectedTenant.membership_state ?? "无成员关系"}</span></div>}</div></header>
+    <main><header className="topbar"><div><h1>{titles[view][0]}</h1><p>{titles[view][1]}</p></div><div className="topbar-actions"><div className="identity-chip"><span>当前账号</span><strong>{snapshot.displayName ?? subject}</strong><button onClick={() => void logout()} aria-label="退出当前账号">退出</button></div><div className="tenant-switcher"><label htmlFor="tenant-selector">当前租户</label><select id="tenant-selector" value={selectedTenantId} onChange={(event) => void selectTenant(event.target.value, tenants)} disabled={tenants.length === 0}><option value="">{tenants.length ? "请选择租户" : "无可用租户"}</option>{tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name} · {tenant.state}</option>)}</select>{selectedTenant && <div><StatusPill value={selectedTenant.state} /><span>{tenantContext?.roles.join(" / ") ?? selectedTenant.membership_state ?? "无成员关系"}</span></div>}</div></div></header>
       <div className="workspace" key={tenantGeneration}>
         {!activeTenant && view !== "administration" && <section className={`panel tenant-state-card ${selectedTenant?.state ?? "unauthorized"}`}><StatusPill value={selectedTenant?.state ?? "no-membership"} /><h2>{selectedTenant ? `${selectedTenant.name} 当前不可访问` : "当前账号没有可访问的租户"}</h2><p>{selectedTenant?.state === "provisioning" ? "租户仍在开通中。" : selectedTenant?.state === "suspended" ? "租户已暂停，数据面请求会被拒绝。" : selectedTenant?.state === "archived" ? "租户已归档。" : "请联系平台管理员分配有效的租户成员关系。"}</p>{platformAdministrator && <button className="primary" onClick={() => setView("administration")}>进入平台租户控制台</button>}</section>}
         {activeTenant && view === "chat" && <ChatView notify={notify} />}

@@ -144,36 +144,12 @@ export type TenantUsage = {
   warning: boolean;
 };
 
-let selectedTenantId = "";
-
-export function setTenantBoundary(tenantId: string): void {
-  selectedTenantId = tenantId;
-}
-
-export function getTenantBoundary(): string {
-  return selectedTenantId;
-}
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? "";
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("X-Correlation-ID", crypto.randomUUID());
-  if (selectedTenantId && !path.startsWith("/api/v1/tenants")) {
-    headers.set("X-Tenant-ID", selectedTenantId);
-  }
-  if (init?.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { message?: string; detail?: string };
-    throw new Error(body.message ?? body.detail ?? `请求失败（${response.status}）`);
-  }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  return authenticatedJson<T>(path, init);
 }
 
 export const api = {
-  health: () => request<HealthResponse>("/health/ready"),
+  health: () => publicJson<HealthResponse>("/health/ready"),
   discoverTenants: () =>
     request<{ platform_roles: string[]; items: TenantSummary[] }>("/api/v1/tenants"),
   tenantContext: () => request<TenantContext>("/api/v1/tenant/context"),
@@ -315,6 +291,8 @@ export const api = {
     request<{ items: Array<{ id: string; text: string; page: number | null; section: string | null }> }>(
       `/api/v1/documents/${id}/preview`,
     ),
+  downloadDocument: (id: string, fallbackFilename: string) =>
+    downloadProtectedResource(`/api/v1/documents/${id}/download`, fallbackFilename),
   documentVersions: (id: string) =>
     request<{ items: Array<{ id: string; state: string; active: boolean; created_at: string }> }>(
       `/api/v1/documents/${id}/versions`,
@@ -360,6 +338,8 @@ export const api = {
       preview_url: string;
       download_url: string;
     }>(url),
+  downloadSource: (url: string, fallbackFilename: string) =>
+    downloadProtectedResource(url, fallbackFilename),
   datasets: () => request<{ items: EvaluationDataset[] }>("/api/v1/evaluation/datasets"),
   createDataset: (name: string, items: unknown[]) =>
     request<{ id: string; version_id: string }>("/api/v1/evaluation/datasets", {
@@ -401,31 +381,64 @@ export async function streamQuery(
   question: string,
   conversationId: string | null,
   onEvent: (event: string, data: Record<string, unknown>) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
-  const headers = new Headers({
-    "Content-Type": "application/json",
-    "X-Correlation-ID": crypto.randomUUID(),
-  });
-  if (selectedTenantId) headers.set("X-Tenant-ID", selectedTenantId);
-  const response = await fetch(`${API_BASE}/api/v1/chat/query`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ assistant_id: assistantId, question, conversation_id: conversationId }),
-  });
-  if (!response.ok || !response.body) throw new Error(`问答请求失败（${response.status}）`);
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() ?? "";
-    for (const block of blocks) {
-      const event = block.match(/^event: (.+)$/m)?.[1];
-      const data = block.match(/^data: (.+)$/m)?.[1];
-      if (event && data) onEvent(event, JSON.parse(data) as Record<string, unknown>);
+  const client = getAuthClient();
+  const streamController = new AbortController();
+  const abortStream = () => streamController.abort(signal?.reason);
+  if (signal?.aborted) abortStream();
+  else signal?.addEventListener("abort", abortStream, { once: true });
+  const unregister = client.registerRequest(streamController);
+  const captured = captureRequestBoundary();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  try {
+    const response = await authenticatedFetch("/api/v1/chat/query", {
+      method: "POST",
+      signal: streamController.signal,
+      body: JSON.stringify({ assistant_id: assistantId, question, conversation_id: conversationId }),
+    });
+    if (!response.ok || !response.body) throw new Error(`问答请求失败（${response.status}）`);
+    reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      assertRequestBoundary(captured);
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      const blocks = buffer.split("\n\n");
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) {
+        const event = block.match(/^event: (.+)$/m)?.[1];
+        const data = block.match(/^data: (.+)$/m)?.[1];
+        if (event && data) onEvent(event, JSON.parse(data) as Record<string, unknown>);
+      }
+      if (done) break;
     }
-    if (done) break;
+  } finally {
+    signal?.removeEventListener("abort", abortStream);
+    if (streamController.signal.aborted) await reader?.cancel().catch(() => undefined);
+    unregister();
   }
 }
+import {
+  assertRequestBoundary,
+  authenticatedFetch,
+  authenticatedJson,
+  captureRequestBoundary,
+  downloadProtectedResource,
+  getAuthClient,
+  getTenantBoundary,
+  publicJson,
+  rememberedTenantForSubject,
+  rememberTenantForSubject,
+  resetTenantBoundary,
+  setTenantBoundary,
+} from "./transport";
+
+export {
+  getTenantBoundary,
+  rememberedTenantForSubject,
+  rememberTenantForSubject,
+  resetTenantBoundary,
+  setTenantBoundary,
+};
