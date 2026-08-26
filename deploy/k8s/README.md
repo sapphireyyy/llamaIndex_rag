@@ -14,5 +14,5 @@ four hours until a measured production baseline replaces these initial objective
 `provider-data-policies.yaml` contains the required encrypted/retained StorageClass contract,
 worker disruption budget, backlog autoscaling, and egress policy. Replace its placeholder CSI
 provisioner with the approved platform driver. Managed PostgreSQL, object storage, RabbitMQ,
-Qdrant, OpenSearch, and Keycloak should be provisioned by the platform's approved operators or
+Milvus, OpenSearch, and Keycloak should be provisioned by the platform's approved operators or
 infrastructure-as-code modules with point-in-time recovery and private endpoints.

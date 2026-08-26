@@ -35,9 +35,12 @@ class Settings(BaseSettings):
     rabbitmq_queue_name: str = "enterprise-rag-jobs"
     cache_backend: Literal["memory", "redis"] = "memory"
     redis_url: str = "redis://localhost:6379/0"
-    vector_backend: Literal["memory", "qdrant"] = "qdrant"
+    vector_backend: Literal["memory", "qdrant", "milvus"] = "milvus"
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "enterprise-rag-chunks"
+    milvus_url: str = "http://localhost:19530"
+    milvus_collection: str = "enterprise_rag_chunks"
+    milvus_token_reference: str = ""
     lexical_backend: Literal["memory", "opensearch"] = "memory"
     opensearch_url: str = "http://localhost:9200"
     opensearch_index: str = "enterprise-rag-chunks"
@@ -131,6 +134,8 @@ class Settings(BaseSettings):
             problems.append("RabbitMQ requires a secret URL reference")
         if self.vector_backend == "qdrant" and not self.qdrant_url:
             problems.append("Qdrant requires a service URL")
+        if self.vector_backend == "milvus" and not self.milvus_url:
+            problems.append("Milvus requires a service URL")
         if self.lexical_backend == "opensearch" and not self.opensearch_url:
             problems.append("OpenSearch requires a service URL")
         if self.cache_backend == "redis" and not self.redis_url:

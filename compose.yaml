@@ -38,10 +38,52 @@ services:
     ports: ["6379:6379"]
     volumes: ["redis-data:/data"]
 
-  qdrant:
-    image: qdrant/qdrant:v1.15
-    ports: ["6333:6333", "6334:6334"]
-    volumes: ["qdrant-data:/qdrant/storage"]
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >-
+      etcd
+      --advertise-client-urls=http://milvus-etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes: ["milvus-etcd-data:/etcd"]
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    command: server /minio_data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes: ["milvus-minio-data:/minio_data"]
+
+  milvus:
+    image: milvusdb/milvus:v2.5.27
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    ports: ["19530:19530", "9091:9091"]
+    volumes: ["milvus-data:/var/lib/milvus"]
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      milvus-minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
 
   opensearch:
     image: opensearchproject/opensearch:3
@@ -86,8 +128,9 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RAG_CACHE_BACKEND: redis
       RAG_REDIS_URL: redis://redis:6379/0
-      RAG_VECTOR_BACKEND: qdrant
-      RAG_QDRANT_URL: http://qdrant:6333
+      RAG_VECTOR_BACKEND: milvus
+      RAG_MILVUS_URL: http://milvus:19530
+      RAG_MILVUS_COLLECTION: enterprise_rag_chunks
       RAG_LEXICAL_BACKEND: opensearch
       RAG_OPENSEARCH_URL: http://opensearch:9200
       RAG_MODEL_BACKEND: extractive
@@ -107,8 +150,8 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      qdrant:
-        condition: service_started
+      milvus:
+        condition: service_healthy
       opensearch:
         condition: service_started
       keycloak:
@@ -146,8 +189,9 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RAG_CACHE_BACKEND: redis
       RAG_REDIS_URL: redis://redis:6379/0
-      RAG_VECTOR_BACKEND: qdrant
-      RAG_QDRANT_URL: http://qdrant:6333
+      RAG_VECTOR_BACKEND: milvus
+      RAG_MILVUS_URL: http://milvus:19530
+      RAG_MILVUS_COLLECTION: enterprise_rag_chunks
       RAG_LEXICAL_BACKEND: opensearch
       RAG_OPENSEARCH_URL: http://opensearch:9200
       RAG_MODEL_BACKEND: extractive
@@ -173,7 +217,9 @@ volumes:
   minio-data:
   rabbitmq-data:
   redis-data:
-  qdrant-data:
+  milvus-etcd-data:
+  milvus-minio-data:
+  milvus-data:
   opensearch-data:
 
 configs:

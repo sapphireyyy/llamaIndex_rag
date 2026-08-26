@@ -15,7 +15,9 @@ data:
   RAG_OIDC_AUDIENCE: enterprise-rag
   RAG_OBJECT_STORE_BACKEND: s3
   RAG_QUEUE_BACKEND: rabbitmq
-  RAG_VECTOR_BACKEND: qdrant
+  RAG_VECTOR_BACKEND: milvus
+  RAG_MILVUS_URL: milvus:19530
+  RAG_MILVUS_COLLECTION: enterprise_rag_chunks
   RAG_LEXICAL_BACKEND: opensearch
   RAG_CONTENT_CAPTURE_ENABLED: "false"
 ---

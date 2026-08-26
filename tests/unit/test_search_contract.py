@@ -5,6 +5,7 @@ from enterprise_rag.infrastructure.search import (
     DeterministicEmbedding,
     MemoryLexicalSearch,
     MemoryVectorSearch,
+    MilvusVectorSearch,
 )
 
 
@@ -42,3 +43,107 @@ async def test_dense_and_lexical_enforce_identical_authorization_filters() -> No
         await vector.retrieve("VPN", stale, 5)
     with pytest.raises(PermissionError, match="stale"):
         await lexical.retrieve("VPN", stale, 5)
+
+
+class _FakeMilvusClient:
+    """为 Milvus 适配器单元测试提供最小同步 SDK 替身。"""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, object]] = []
+        self.search_filter = ""
+
+    def upsert(self, *, collection_name: str, data: list[dict[str, object]]) -> None:
+        del collection_name
+        by_id = {str(row["id"]): row for row in self.rows}
+        by_id.update({str(row["id"]): row for row in data})
+        self.rows = list(by_id.values())
+
+    def query(
+        self,
+        *,
+        collection_name: str,
+        filter: str,
+        output_fields: list[str],
+    ) -> list[dict[str, object]]:
+        del collection_name, output_fields
+        if "document_version_id ==" in filter:
+            return [
+                dict(row)
+                for row in self.rows
+                if row["document_version_id"] == "version-a"
+            ]
+        if "document_id ==" in filter:
+            return [
+                dict(row)
+                for row in self.rows
+                if row["document_id"] == "document-a"
+            ]
+        return [dict(row) for row in self.rows]
+
+    def search(self, *, filter: str, **kwargs: object) -> list[list[dict[str, object]]]:
+        del kwargs
+        self.search_filter = filter
+        row = self.rows[0]
+        return [
+            [
+                {
+                    "distance": 0.91,
+                    "entity": {
+                        "chunk_id": row["chunk_id"],
+                        "text": row["text"],
+                        "metadata": row["metadata"],
+                    },
+                }
+            ]
+        ]
+
+    def delete(self, *, collection_name: str, filter: str) -> None:
+        del collection_name
+        self.rows = [row for row in self.rows if "document-a" not in filter]
+
+    def flush(self, *, collection_name: str) -> None:
+        del collection_name
+
+    def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_milvus_adapter_preserves_publish_acl_and_retrieve_contract() -> None:
+    embedding = DeterministicEmbedding()
+    adapter = MilvusVectorSearch(
+        "http://localhost:19530",
+        "enterprise_rag_chunks",
+        embedding,
+    )
+    fake = _FakeMilvusClient()
+    adapter._client = fake
+    text = "Internal VPN configuration requires manager approval."
+    metadata = {
+        "tenant_id": "tenant-a",
+        "knowledge_space_id": "space-a",
+        "document_id": "document-a",
+        "document_version_id": "version-a",
+        "acl_tokens": ["group:employees"],
+        "title": "VPN policy",
+    }
+    item = IndexDocument("chunk-a", text, (await embedding.embed([text]))[0], metadata)
+
+    await adapter.stage([item])
+    await adapter.publish("version-a")
+    adapter.set_acl_epoch("tenant-a", 4)
+
+    scope = AuthorizationScope(
+        "tenant-a", frozenset({"group:employees"}), frozenset({"space-a"}), 4
+    )
+    results = await adapter.retrieve("VPN approval", scope, 5)
+
+    assert [candidate.chunk_id for candidate in results] == ["chunk-a"]
+    assert results[0].metadata["title"] == "VPN policy"
+    assert 'tenant_id == "tenant-a"' in fake.search_filter
+    assert "ARRAY_CONTAINS_ANY" in fake.search_filter
+    assert "published == true" in fake.search_filter
+
+    await adapter.delete_document("document-a")
+    assert fake.rows == []
+    await adapter.close()

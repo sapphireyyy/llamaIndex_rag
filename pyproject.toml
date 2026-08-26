@@ -36,6 +36,7 @@ providers = [
   "llama-index-embeddings-openai>=0.5,<1",
   "llama-index-llms-openai-like>=0.5,<1",
   "opensearch-py>=3,<4",
+  "pymilvus>=2.5,<3",
   "qdrant-client>=1.15,<2",
   "redis>=6,<7",
 ]

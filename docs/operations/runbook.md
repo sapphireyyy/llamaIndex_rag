@@ -8,15 +8,17 @@ queue ready before traffic. `/metrics` exposes service counters and latency hist
 
 ## Local persistent vector index
 
-Development uses Qdrant for the dense index so API and worker processes share the same
-vectors. Start Qdrant before the API:
+Development uses Milvus for the dense index so API and worker processes share the same
+vectors. Start Milvus before the API:
 
 ```powershell
-docker compose up -d qdrant
-uv run python scripts/reindex_qdrant.py
+docker compose up -d milvus-etcd milvus-minio milvus
+uv sync --extra providers
+uv run --extra providers python scripts/reindex_milvus.py
 ```
 
-The Qdrant data is persisted in the `qdrant-data` Compose volume. Re-run the reindex
+Milvus data is persisted in the `milvus-data`, `milvus-etcd-data`, and `milvus-minio-data`
+Compose volumes. Re-run the reindex
 command after migrating an existing database from the in-memory backend.
 
 ## Incidents

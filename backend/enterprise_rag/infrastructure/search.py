@@ -1,11 +1,13 @@
-"""搜索基础设施：实现内存、Qdrant、OpenSearch 检索及 token 重排。"""
+"""搜索基础设施：实现内存、Milvus、Qdrant、OpenSearch 检索及 token 重排。"""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import httpx
@@ -207,7 +209,7 @@ def _require_scope(scope: AuthorizationScope) -> None:
 
 
 class _RemoteSearchBase:
-    """Qdrant/OpenSearch 远程索引共享 ACL 版本校验逻辑。"""
+    """Milvus/Qdrant/OpenSearch 远程索引共享 ACL 版本校验逻辑。"""
 
     source_name = "remote"
 
@@ -392,6 +394,284 @@ class QdrantVectorSearch(_RemoteSearchBase):
     async def close(self) -> None:
         """关闭 Qdrant HTTP 客户端。"""
         await self._client.aclose()
+
+
+class MilvusVectorSearch(_RemoteSearchBase):
+    """Milvus 稠密检索适配器，保持与 Qdrant 相同的发布和 ACL 合约。"""
+
+    source_name = "dense"
+
+    def __init__(
+        self,
+        uri: str,
+        collection: str,
+        embedding: DeterministicEmbedding,
+        dimensions: int = 64,
+        token: str | None = None,
+    ) -> None:
+        """保存 Milvus 连接参数；同步 SDK 调用会在线程中执行，避免阻塞事件循环。"""
+        super().__init__()
+        self.uri = uri
+        self.collection = collection
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", collection):
+            raise ValueError(
+                "Milvus collection names must contain only letters, numbers, and underscores"
+            )
+        self.embedding = embedding
+        self.dimensions = dimensions
+        self.token = token
+        self._client: Any | None = None
+
+    def _client_or_raise(self) -> Any:
+        """延迟创建 MilvusClient，使 memory/Qdrant 测试不强制安装 Milvus SDK。"""
+        if self._client is not None:
+            return self._client
+        try:
+            from pymilvus import MilvusClient  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise RuntimeError(
+                "Milvus backend requires the optional 'pymilvus' dependency"
+            ) from exc
+        kwargs: dict[str, str] = {"uri": self.uri}
+        if self.token:
+            kwargs["token"] = self.token
+        self._client = MilvusClient(**kwargs)
+        return self._client
+
+    @staticmethod
+    def _quote(value: str) -> str:
+        """把字符串编码为 Milvus 过滤表达式中的安全字符串字面量。"""
+        return json.dumps(value, ensure_ascii=False)
+
+    @classmethod
+    def _in_expression(cls, field: str, values: Sequence[str]) -> str:
+        """生成 Milvus 的 VARCHAR IN 表达式。"""
+        return f"{field} in [{', '.join(cls._quote(value) for value in values)}]"
+
+    @classmethod
+    def _scope_expression(
+        cls,
+        scope: AuthorizationScope,
+        *,
+        published: bool | None = None,
+        document_ids: Collection[str] | None = None,
+    ) -> str:
+        """把租户、知识空间、ACL 和发布状态编译为 Milvus 过滤条件。"""
+        expressions = [
+            f"tenant_id == {cls._quote(scope.tenant_id)}",
+            cls._in_expression("knowledge_space_id", sorted(scope.knowledge_space_ids)),
+            f"ARRAY_CONTAINS_ANY(acl_tokens, {json.dumps(sorted(scope.principal_tokens))})",
+        ]
+        if published is not None:
+            expressions.append(f"published == {'true' if published else 'false'}")
+        if document_ids:
+            expressions.append(cls._in_expression("document_id", sorted(document_ids)))
+        return " && ".join(expressions)
+
+    def _schema(self) -> Any:
+        """创建固定字段 schema，把权限字段显式化以支持服务端过滤。"""
+        from pymilvus import DataType, MilvusClient
+
+        schema = MilvusClient.create_schema(
+            auto_id=False,
+            enable_dynamic_field=False,
+        )
+        schema.add_field(
+            field_name="id",
+            datatype=DataType.VARCHAR,
+            is_primary=True,
+            max_length=512,
+        )
+        schema.add_field(
+            field_name="vector",
+            datatype=DataType.FLOAT_VECTOR,
+            dim=self.dimensions,
+        )
+        schema.add_field(field_name="chunk_id", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
+        schema.add_field(field_name="tenant_id", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(
+            field_name="knowledge_space_id",
+            datatype=DataType.VARCHAR,
+            max_length=512,
+        )
+        schema.add_field(field_name="document_id", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(
+            field_name="document_version_id",
+            datatype=DataType.VARCHAR,
+            max_length=512,
+        )
+        schema.add_field(
+            field_name="acl_tokens",
+            datatype=DataType.ARRAY,
+            element_type=DataType.VARCHAR,
+            max_capacity=256,
+            max_length=512,
+        )
+        schema.add_field(field_name="published", datatype=DataType.BOOL)
+        schema.add_field(field_name="metadata", datatype=DataType.JSON)
+        return schema
+
+    def _start_sync(self) -> None:
+        """连接 Milvus 并创建带 COSINE 索引的集合。"""
+        client = self._client_or_raise()
+        if client.has_collection(collection_name=self.collection):
+            return
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="vector",
+            index_type="AUTOINDEX",
+            metric_type="COSINE",
+        )
+        client.create_collection(
+            collection_name=self.collection,
+            schema=self._schema(),
+            index_params=index_params,
+        )
+
+    @staticmethod
+    def _row(document: IndexDocument) -> dict[str, Any]:
+        """把领域索引文档映射为 Milvus 实体行。"""
+        metadata = dict(document.metadata)
+        acl_tokens = [str(item) for item in metadata.get("acl_tokens", [])]
+        return {
+            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, document.chunk_id)),
+            "vector": list(document.embedding),
+            "chunk_id": document.chunk_id,
+            "text": document.text,
+            "tenant_id": str(metadata["tenant_id"]),
+            "knowledge_space_id": str(metadata["knowledge_space_id"]),
+            "document_id": str(metadata["document_id"]),
+            "document_version_id": str(metadata["document_version_id"]),
+            "acl_tokens": acl_tokens,
+            "published": False,
+            "metadata": metadata,
+        }
+
+    def _flush_sync(self) -> None:
+        """等待实体进入可查询状态，保证发布后立即检索的一致性。"""
+        self._client_or_raise().flush(collection_name=self.collection)
+
+    async def start(self) -> None:
+        """创建 Milvus 集合并建立向量索引。"""
+        await asyncio.to_thread(self._start_sync)
+
+    async def stage(self, documents: Sequence[IndexDocument]) -> None:
+        """以 published=false upsert 待发布实体，保持旧版本仍可检索。"""
+        if not documents:
+            return
+        rows = [self._row(document) for document in documents]
+        await asyncio.to_thread(
+            self._client_or_raise().upsert,
+            collection_name=self.collection,
+            data=rows,
+        )
+        await asyncio.to_thread(self._flush_sync)
+
+    def _query_all_sync(self, expression: str) -> list[dict[str, Any]]:
+        """查询完整实体，供发布状态的读改写使用。"""
+        rows = self._client_or_raise().query(
+            collection_name=self.collection,
+            filter=expression,
+            output_fields=["*"],
+        )
+        return [dict(row) for row in rows]
+
+    def _set_published_sync(self, expression: str, value: bool) -> int:
+        """按过滤条件读改写完整实体，避免依赖特定版本的部分更新语法。"""
+        rows = self._query_all_sync(expression)
+        for row in rows:
+            row["published"] = value
+        if rows:
+            self._client_or_raise().upsert(
+                collection_name=self.collection,
+                data=rows,
+            )
+            self._flush_sync()
+        return len(rows)
+
+    async def publish(self, document_version_id: str) -> None:
+        """先隐藏同文档旧版本，再发布目标版本。"""
+        version_expression = f"document_version_id == {self._quote(document_version_id)}"
+        rows = await asyncio.to_thread(self._query_all_sync, version_expression)
+        if not rows:
+            raise RuntimeError("cannot publish an empty staged document version")
+        document_id = str(rows[0]["document_id"])
+        await asyncio.to_thread(
+            self._set_published_sync,
+            f"document_id == {self._quote(document_id)}",
+            False,
+        )
+        await asyncio.to_thread(self._set_published_sync, version_expression, True)
+
+    async def delete_document(self, document_id: str) -> None:
+        """删除 Milvus 中属于指定文档的全部实体。"""
+        expression = f"document_id == {self._quote(document_id)}"
+        await asyncio.to_thread(
+            self._client_or_raise().delete,
+            collection_name=self.collection,
+            filter=expression,
+        )
+        await asyncio.to_thread(self._flush_sync)
+
+    async def retrieve(
+        self, query: str, scope: AuthorizationScope, top_k: int
+    ) -> list[RetrievalCandidate]:
+        """执行带租户、知识空间、ACL 和发布状态过滤的 COSINE 向量搜索。"""
+        self._validate_scope(scope)
+        if not scope.principal_tokens:
+            return []
+        vector = (await self.embedding.embed([query]))[0]
+        expression = self._scope_expression(
+            scope,
+            published=True,
+            document_ids=scope.document_ids,
+        )
+        hits = await asyncio.to_thread(
+            self._client_or_raise().search,
+            collection_name=self.collection,
+            data=[list(vector)],
+            anns_field="vector",
+            filter=expression,
+            limit=top_k,
+            output_fields=["chunk_id", "text", "metadata"],
+            search_params={"metric_type": "COSINE", "params": {}},
+        )
+        candidates: list[RetrievalCandidate] = []
+        for hit in hits[0] if hits else []:
+            entity = hit.get("entity", hit)
+            metadata = entity.get("metadata") or {}
+            candidates.append(
+                RetrievalCandidate(
+                    str(entity["chunk_id"]),
+                    str(entity["text"]),
+                    float(hit.get("distance", hit.get("score", 0.0))),
+                    dict(metadata),
+                    self.source_name,
+                )
+            )
+        return candidates
+
+    async def health(self) -> bool:
+        """检查 Milvus 集合是否可访问。"""
+        try:
+            return bool(
+                await asyncio.to_thread(
+                    self._client_or_raise().has_collection,
+                    collection_name=self.collection,
+                )
+            )
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        """关闭 Milvus 客户端。"""
+        client = self._client
+        self._client = None
+        if client is not None:
+            closer = getattr(client, "close", None)
+            if closer is not None:
+                await asyncio.to_thread(closer)
 
 
 class OpenSearchLexicalSearch(_RemoteSearchBase):

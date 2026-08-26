@@ -46,6 +46,7 @@ from enterprise_rag.infrastructure.search import (
     DeterministicEmbedding,
     MemoryLexicalSearch,
     MemoryVectorSearch,
+    MilvusVectorSearch,
     OpenSearchLexicalSearch,
     QdrantVectorSearch,
     TokenOverlapReranker,
@@ -120,6 +121,18 @@ class Container:
                 self.settings.qdrant_url,
                 self.settings.qdrant_collection,
                 self.embedding,
+            )
+        elif self.settings.vector_backend == "milvus":
+            milvus_token = None
+            if self.settings.milvus_token_reference:
+                milvus_token = await secrets.resolve(
+                    self.settings.milvus_token_reference
+                )
+            self.dense_index = MilvusVectorSearch(
+                self.settings.milvus_url,
+                self.settings.milvus_collection,
+                self.embedding,
+                token=milvus_token,
             )
         else:
             self.dense_index = MemoryVectorSearch(self.embedding)

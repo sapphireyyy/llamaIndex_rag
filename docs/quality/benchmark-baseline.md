@@ -11,7 +11,7 @@ serial hybrid queries:
 These are repeatable engineering baselines, not production SLO evidence. The run excludes
 network, durable provider, parser, model generation, and concurrent user latency. Production
 acceptance must replace these values after a full three-domain corpus run on the selected
-PostgreSQL, object store, queue, Qdrant, OpenSearch, OIDC, and model providers.
+PostgreSQL, object store, queue, Milvus, OpenSearch, OIDC, and model providers.
 
 Initial objectives are: API availability 99.9%, freshness p95 under five minutes, query p95
 under five seconds excluding provider-declared long generation, no unauthorized retrieval,
