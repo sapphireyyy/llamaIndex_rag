@@ -11,8 +11,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
-      - run: uv sync --all-groups
+          python-version: "3.11"
+      - run: uv sync --all-groups --all-extras
       - run: uv run ruff check .
       - run: uv run mypy backend
       - run: uv run pytest --cov=enterprise_rag --cov-report=term-missing
@@ -43,4 +43,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npx --yes @fission-ai/openspec validate build-general-enterprise-rag-assistant --type change --strict --no-interactive
-
