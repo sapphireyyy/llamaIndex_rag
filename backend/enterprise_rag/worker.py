@@ -8,6 +8,7 @@ from contextlib import suppress
 
 import structlog
 
+from enterprise_rag.application.worker import IngestionWorker
 from enterprise_rag.config import get_settings
 from enterprise_rag.infrastructure.container import Container
 
@@ -24,8 +25,10 @@ async def run_worker() -> None:
         with suppress(NotImplementedError):
             loop.add_signal_handler(signame, stop.set)
     log.info("worker_ready")
-    await stop.wait()
-    await container.stop()
+    try:
+        await IngestionWorker(container).run(stop)
+    finally:
+        await container.stop()
 
 
 def main() -> None:

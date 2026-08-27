@@ -6,12 +6,17 @@ services:
     environment:
       POSTGRES_DB: enterprise_rag
       POSTGRES_USER: enterprise_rag
-      POSTGRES_PASSWORD: enterprise_rag_dev
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_migration_password
+    secrets:
+      - postgres_migration_password
+      - postgres_runtime_password
     ports: ["5432:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
     configs:
       - source: postgres-runtime-role
         target: /docker-entrypoint-initdb.d/10-runtime-role.sql
+      - source: postgres-runtime-role-runner
+        target: /docker-entrypoint-initdb.d/09-runtime-role.sh
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U enterprise_rag"]
       interval: 5s
@@ -105,6 +110,23 @@ services:
     volumes:
       - ./deploy/keycloak/enterprise-rag-realm.json:/opt/keycloak/data/import/enterprise-rag-realm.json:ro
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: enterprise-rag-migrate:local
+    env_file:
+      - .env
+    environment:
+      RAG_ENVIRONMENT: staging
+      RAG_DATABASE_URL: ${RAG_MIGRATION_DATABASE_URL:?Set RAG_MIGRATION_DATABASE_URL from the migration secret scope}
+      RAG_MIGRATION_DATABASE_URL: ${RAG_MIGRATION_DATABASE_URL:?Set RAG_MIGRATION_DATABASE_URL from the migration secret scope}
+    command: [".venv/bin/alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: .
@@ -115,7 +137,9 @@ services:
     environment:
       RAG_API_HOST: 0.0.0.0
       RAG_ENVIRONMENT: staging
-      RAG_DATABASE_URL: postgresql+asyncpg://enterprise_rag_app:enterprise_rag_app_dev@postgres:5432/enterprise_rag
+      RAG_DATABASE_URL: ${RAG_RUNTIME_DATABASE_URL:?Set RAG_RUNTIME_DATABASE_URL from the runtime secret scope}
+      RAG_MIGRATION_DATABASE_URL: ""
+      RAG_INGESTION_EXECUTION_MODE: queued
       RAG_OIDC_ENABLED: "true"
       RAG_OIDC_ISSUER: http://localhost:8080/realms/enterprise-rag
       RAG_OIDC_JWKS_URL: http://keycloak:8080/realms/enterprise-rag/protocol/openid-connect/certs
@@ -137,11 +161,12 @@ services:
       RAG_ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000,http://localhost:5173
       MINIO_ROOT_USER: enterprise-rag
       MINIO_ROOT_PASSWORD: enterprise-rag-dev-secret
-    command:
-      ["sh", "-c", "RAG_DATABASE_URL=postgresql+asyncpg://enterprise_rag:enterprise_rag_dev@postgres:5432/enterprise_rag .venv/bin/alembic upgrade head && exec .venv/bin/uvicorn enterprise_rag.main:app --app-dir backend --host 0.0.0.0 --port 8000 --no-access-log"]
+    command: [".venv/bin/uvicorn", "enterprise_rag.main:app", "--app-dir", "backend", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
     ports: ["127.0.0.1:8101:8000"]
     restart: unless-stopped
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       minio:
@@ -176,7 +201,10 @@ services:
       - .env
     environment:
       RAG_ENVIRONMENT: staging
-      RAG_DATABASE_URL: postgresql+asyncpg://enterprise_rag_app:enterprise_rag_app_dev@postgres:5432/enterprise_rag
+      RAG_DATABASE_URL: ${RAG_RUNTIME_DATABASE_URL:?Set RAG_RUNTIME_DATABASE_URL from the runtime secret scope}
+      RAG_MIGRATION_DATABASE_URL: ""
+      RAG_INGESTION_EXECUTION_MODE: queued
+      RAG_WORKER_TENANT_IDS: tenant-demo
       RAG_OIDC_ENABLED: "true"
       RAG_OIDC_ISSUER: http://localhost:8080/realms/enterprise-rag
       RAG_OIDC_JWKS_URL: http://keycloak:8080/realms/enterprise-rag/protocol/openid-connect/certs
@@ -236,3 +264,11 @@ volumes:
 configs:
   postgres-runtime-role:
     file: ./deploy/postgres/init-runtime-role.sql
+  postgres-runtime-role-runner:
+    file: ./deploy/postgres/init-runtime-role.sh
+
+secrets:
+  postgres_migration_password:
+    file: ${POSTGRES_MIGRATION_PASSWORD_FILE:?Set POSTGRES_MIGRATION_PASSWORD_FILE to a deployment secret file}
+  postgres_runtime_password:
+    file: ${POSTGRES_RUNTIME_PASSWORD_FILE:?Set POSTGRES_RUNTIME_PASSWORD_FILE to a deployment secret file}

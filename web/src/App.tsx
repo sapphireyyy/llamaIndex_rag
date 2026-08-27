@@ -13,6 +13,8 @@ import {
   type EvaluationRun,
   type HealthResponse,
   type Job,
+  type Policy,
+  type ProviderProfile,
   type Source,
   type Space,
   type TenantContext,
@@ -59,6 +61,14 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
     return () => window.clearTimeout(timer);
   }, [refresh, notify]);
 
+  useEffect(() => {
+    if (!jobs.some((job) => ["queued", "running"].includes(job.status))) return undefined;
+    const timer = window.setInterval(() => {
+      void refresh().catch((error: Error) => notify({ tone: "error", text: error.message }));
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [jobs, refresh, notify]);
+
   async function create(event: FormEvent) {
     event.preventDefault();
     try {
@@ -87,7 +97,24 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
     try {
       const sourceId = await ensureUploadSource();
       const job = await api.upload(sourceId, file);
-      notify({ tone: job.status === "succeeded" ? "ok" : "error", text: `摄取任务：${job.stage}` });
+      notify({ tone: "ok", text: job.status === "queued" ? "文档已进入队列，后台处理中" : `摄取任务：${job.stage}` });
+      await refresh();
+    } catch (error) { notify({ tone: "error", text: (error as Error).message }); }
+  }
+
+  async function rebuildSpace() {
+    if (!selectedSpace) return;
+    try {
+      const result = await api.rebuildKnowledgeSpace(selectedSpace.id);
+      notify({ tone: "ok", text: `知识空间已提交 ${result.count} 个重建任务` });
+      await refresh();
+    } catch (error) { notify({ tone: "error", text: (error as Error).message }); }
+  }
+
+  async function rebuildSource(source: Source) {
+    try {
+      const result = await api.rebuildDataSource(source.id);
+      notify({ tone: "ok", text: `数据源已提交 ${result.count} 个重建任务` });
       await refresh();
     } catch (error) { notify({ tone: "error", text: (error as Error).message }); }
   }
@@ -106,9 +133,31 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
     const [content, versions] = await Promise.all([
       api.previewDocument(item.id), api.documentVersions(item.id),
     ]);
+    const generationLines = versions.items.flatMap((version) => version.generations.map(
+      (generation) => `  ${generation.active ? "●" : "○"} g${generation.generation_number} · ${generation.state} · ${generation.processing_strategy_version} · ${generation.processing_config_hash.slice(0, 12)}`,
+    ));
     setPreview(
-      `版本历史\n${versions.items.map((version) => `${version.active ? "●" : "○"} ${version.id} · ${version.state}`).join("\n")}\n\n正文预览\n${content.items.map((chunk) => chunk.text).join("\n\n")}`,
+      `版本历史\n${versions.items.map((version) => `${version.active ? "●" : "○"} ${version.id} · ${version.state}`).join("\n")}\n\n处理代次\n${generationLines.join("\n") || "暂无处理代次"}\n\n正文预览\n${content.items.map((chunk) => chunk.text).join("\n\n")}`,
     );
+  }
+
+  async function rollbackLastGeneration(item: DocumentItem) {
+    const versions = await api.documentVersions(item.id);
+    const candidate = versions.items
+      .flatMap((version) => version.generations)
+      .find((generation) => !generation.active && generation.state === "superseded"
+        && generation.dense_state === "published" && generation.lexical_state === "published");
+    if (!candidate) {
+      notify({ tone: "error", text: "没有可安全回切的已发布历史代次" });
+      return;
+    }
+    if (!window.confirm(`确认回切到处理代次 g${candidate.generation_number}？`)) return;
+    try {
+      await api.rollbackGeneration(item.id, candidate.id);
+      notify({ tone: "ok", text: `已回切到处理代次 g${candidate.generation_number}` });
+      await refresh();
+      await showPreview(item);
+    } catch (error) { notify({ tone: "error", text: (error as Error).message }); }
   }
 
   const selectedSpace = spaces.find((item) => item.id === selected);
@@ -134,7 +183,7 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
         <section className="panel">
           <div className="panel-title">
             <div><h2>{selectedSpace?.name ?? "请选择知识空间"}</h2><p>成员变化即时刷新授权纪元，归档后不参与检索。</p></div>
-            {selectedSpace && <div className="actions"><button onClick={() => void editSelected()}>编辑</button><button onClick={() => void api.spaceAction(selectedSpace.id, selectedSpace.state === "active" ? "archive" : "restore").then(refresh)}>{selectedSpace.state === "active" ? "归档" : "恢复"}</button></div>}
+            {selectedSpace && <div className="actions"><button onClick={() => void editSelected()}>编辑</button><button onClick={() => void rebuildSpace()}>重建空间</button><button onClick={() => void api.spaceAction(selectedSpace.id, selectedSpace.state === "active" ? "archive" : "restore").then(refresh)}>{selectedSpace.state === "active" ? "归档" : "恢复"}</button></div>}
           </div>
           {selectedSpace && (
             <div className="form-row">
@@ -143,11 +192,12 @@ function SpacesView({ notify }: { notify: (notice: Notice) => void }) {
               <button onClick={() => void api.setMembership(selected, principal, (document.getElementById("member-role") as HTMLSelectElement).value).then(() => notify({ tone: "ok", text: "成员权限已更新" }))}>分配成员</button>
             </div>
           )}
+          {selectedSpace && <div className="source-list"><div className="panel-title"><h3>数据源</h3><span>{sources.length}</span></div>{sources.map((source) => <div className="source-row" key={source.id}><span>{source.kind} · {source.external_id}</span><button onClick={() => void rebuildSource(source)}>重建数据源</button></div>)}</div>}
         </section>
         <section className="panel">
           <div className="panel-title"><div><h2>文档与摄取</h2><p>先暂存并验证双索引，成功后才切换活动版本。</p></div><label className="upload-button">上传文档<input type="file" onChange={(event) => void upload(event.target.files?.[0])} /></label></div>
           <div className="table-wrap"><table><thead><tr><th>文档</th><th>状态</th><th>活动版本</th><th>操作</th></tr></thead><tbody>
-            {documents.filter((item) => !selected || item.knowledge_space_id === selected).map((item) => <tr key={item.id}><td>{item.title}</td><td><StatusPill value={item.state} /></td><td className="mono">{item.active_version_id?.slice(-10) ?? "—"}</td><td className="actions"><button onClick={() => void showPreview(item)}>版本与预览</button><button onClick={() => void api.downloadDocument(item.id, item.title)}>下载</button><button className="danger" onClick={() => void api.deleteDocument(item.id).then(refresh)}>删除</button></td></tr>)}
+            {documents.filter((item) => !selected || item.knowledge_space_id === selected).map((item) => <tr key={item.id}><td>{item.title}</td><td><StatusPill value={item.state} /></td><td className="mono">{item.active_generation_id?.slice(-10) ?? item.active_version_id?.slice(-10) ?? "处理中"}</td><td className="actions"><button onClick={() => void showPreview(item)}>版本与预览</button><button onClick={() => void api.rebuildDocument(item.id).then(refresh)}>重建索引</button><button onClick={() => void rollbackLastGeneration(item)}>回切历史代次</button><button onClick={() => void api.downloadDocument(item.id, item.title)}>下载</button><button className="danger" onClick={() => void api.deleteDocument(item.id).then(refresh)}>删除</button></td></tr>)}
           </tbody></table></div>
           {preview && <div className="preview"><button className="close" aria-label="关闭文档预览" onClick={() => setPreview("")}>×</button><pre>{preview}</pre></div>}
         </section>
@@ -161,13 +211,15 @@ function AssistantsView({ notify }: { notify: (notice: Notice) => void }) {
   const [assistants, setAssistants] = useState<Assistant[]>([]);
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [history, setHistory] = useState<AssistantVersion[]>([]);
+  const [providers, setProviders] = useState<ProviderProfile[]>([]);
+  const [policies, setPolicies] = useState<Policy[]>([]);
   const [selected, setSelected] = useState("");
   const [spaceId, setSpaceId] = useState("");
   const [name, setName] = useState("");
 
   const refresh = useCallback(async () => {
-    const [assistantResult, spaceResult] = await Promise.all([api.assistants(), api.spaces()]);
-    setAssistants(assistantResult.items); setSpaces(spaceResult.items);
+    const [assistantResult, spaceResult, providerResult, policyResult] = await Promise.all([api.assistants(), api.spaces(), api.providers(), api.policies()]);
+    setAssistants(assistantResult.items); setSpaces(spaceResult.items); setProviders(providerResult.items); setPolicies(policyResult.items);
     const assistantId = selected || assistantResult.items[0]?.id || "";
     setSelected(assistantId); setSpaceId((current) => current || spaceResult.items[0]?.id || "");
     setHistory(assistantId ? (await api.assistantHistory(assistantId)).items : []);
@@ -202,9 +254,20 @@ function AssistantsView({ notify }: { notify: (notice: Notice) => void }) {
     catch (error) { notify({ tone: "error", text: (error as Error).message }); }
   }
 
+  const activeVersion = history.find((version) => version.state === "active") ?? history[0];
+  const modelId = activeVersion?.provider_profile_ids?.model;
+  const retrievalPolicyId = activeVersion?.policy_version_ids?.retrieval;
+  const model = providers.find((profile) => profile.id === modelId);
+  const retrievalPolicy = policies.find((policy) => policy.id === retrievalPolicyId);
+  const componentCards = [
+    ["模型 Provider", model ? `${model.name} · ${model.adapter}` : "未显式绑定（开发运行时默认）", model ? model.capabilities.join(" · ") : "production 需要已验证的生成式 Provider"],
+    ["检索策略", retrievalPolicy ? `${retrievalPolicy.policy_id ?? retrievalPolicy.id} · v${retrievalPolicy.version}` : "未解析", retrievalPolicy ? `已${retrievalPolicy.state === "active" ? "激活" : "校验"} · ${retrievalPolicy.content_hash?.slice(0, 12) ?? "有版本"}` : "必须引用当前租户的活动版本"],
+    ["知识空间", `${activeVersion?.knowledge_space_ids.length ?? 0} 个空间`, "查询开始后按助手版本冻结"],
+  ];
+
   return <div className="page-grid">
     <section className="panel side-panel"><div className="panel-title"><h2>助手</h2><span>{assistants.length}</span></div><form className="stack" onSubmit={create}><input value={name} onChange={(event) => setName(event.target.value)} placeholder="助手名称" required /><select value={spaceId} onChange={(event) => setSpaceId(event.target.value)}>{spaces.filter((space) => space.state === "active").map((space) => <option value={space.id} key={space.id}>{space.name}</option>)}</select><button className="primary" type="submit">创建并激活</button></form><div className="item-list">{assistants.map((assistant) => <button className={`list-item ${selected === assistant.id ? "selected" : ""}`} key={assistant.id} onClick={() => { setSelected(assistant.id); void api.assistantHistory(assistant.id).then((result) => setHistory(result.items)); }}><strong>{assistant.name}</strong><small className="mono">{assistant.active_version_id?.slice(-10) ?? "未激活"}</small></button>)}</div></section>
-    <div className="content-stack"><section className="panel"><div className="panel-title"><div><h2>组件化配置</h2><p>提示词、检索、引用、拒答、护栏和供应商都以不可变版本快照绑定。</p></div><button disabled={!selected || !spaceId} onClick={() => void newDraft()}>新建草稿</button></div><div className="component-grid">{["提示词", "模型", "检索", "引用", "拒答", "护栏"].map((label) => <div className="component-card" key={label}><small>{label}</small><strong>租户默认配置</strong><span>版本化 · 已校验</span></div>)}</div></section><section className="panel"><div className="panel-title"><h2>版本历史与回滚</h2></div><div className="timeline">{history.map((version) => <div className="timeline-item" key={version.id}><div className="timeline-dot" /><div><strong>版本 {version.version}</strong> <StatusPill value={version.state} /><p className="mono">{version.id}</p>{version.validation_errors.length > 0 && <p className="error-text">{version.validation_errors.join("；")}</p>}</div><button onClick={() => void activate(version.id)}>{version.state === "active" ? "重新校验并回滚" : "激活"}</button></div>)}</div></section></div>
+    <div className="content-stack"><section className="panel"><div className="panel-title"><div><h2>组件化配置</h2><p>以下内容来自当前助手活动版本；Provider、检索策略和能力校验结果会随版本冻结。</p></div><button disabled={!selected || !spaceId} onClick={() => void newDraft()}>新建草稿</button></div><div className="component-grid">{componentCards.map(([label, value, detail]) => <div className="component-card" key={label}><small>{label}</small><strong>{value}</strong><span>{detail}</span></div>)}</div>{activeVersion && <p className="mono">活动助手版本 v{activeVersion.version} · {activeVersion.config_hash}</p>}{activeVersion?.validation_errors.length ? <p className="error-text">{activeVersion.validation_errors.join("；")}</p> : null}</section><section className="panel"><div className="panel-title"><h2>版本历史与回滚</h2></div><div className="timeline">{history.map((version) => <div className="timeline-item" key={version.id}><div className="timeline-dot" /><div><strong>版本 {version.version}</strong> <StatusPill value={version.state} /><p className="mono">{version.id}</p>{version.validation_errors.length > 0 && <p className="error-text">{version.validation_errors.join("；")}</p>}</div><button onClick={() => void activate(version.id)}>{version.state === "active" ? "重新校验并回滚" : "激活"}</button></div>)}</div></section></div>
   </div>;
 }
 

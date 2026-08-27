@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from enterprise_rag.application.ports import IndexDocument
 from enterprise_rag.domain.types import AuthorizationScope
@@ -6,6 +8,8 @@ from enterprise_rag.infrastructure.search import (
     MemoryLexicalSearch,
     MemoryVectorSearch,
     MilvusVectorSearch,
+    OpenSearchLexicalSearch,
+    QdrantVectorSearch,
 )
 
 
@@ -147,3 +151,52 @@ async def test_milvus_adapter_preserves_publish_acl_and_retrieve_contract() -> N
     await adapter.delete_document("document-a")
     assert fake.rows == []
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_reconciliation_inspection_omits_indexed_text(respx_mock) -> None:
+    metadata = {
+        "tenant_id": "tenant-a",
+        "knowledge_space_id": "space-a",
+        "document_id": "document-a",
+        "document_version_id": "version-a",
+        "index_generation_id": "generation-a",
+        "acl_tokens": ["group:employees"],
+        "acl_epoch": 4,
+    }
+    qdrant_route = respx_mock.post(
+        "http://qdrant.example/collections/test/points/scroll"
+    ).respond(
+        200,
+        json={"result": {"points": [{"payload": {**metadata, "published": True}}]}},
+    )
+    qdrant = QdrantVectorSearch(
+        "http://qdrant.example", "test", DeterministicEmbedding()
+    )
+    qdrant_report = await qdrant.inspect_generation("document-a", "generation-a")
+    qdrant_payload = json.loads(qdrant_route.calls[0].request.content)
+    assert qdrant_report["count"] == 1
+    assert qdrant_report["published_count"] == 1
+    assert "text" not in qdrant_payload["with_payload"]
+    await qdrant.close()
+
+    opensearch_route = respx_mock.post(
+        "http://opensearch.example/test/_search"
+    ).respond(
+        200,
+        json={
+            "hits": {
+                "total": {"value": 1, "relation": "eq"},
+                "hits": [{"_source": {**metadata, "published": True}}],
+            }
+        },
+    )
+    opensearch = OpenSearchLexicalSearch("http://opensearch.example", "test")
+    opensearch_report = await opensearch.inspect_generation(
+        "document-a", "generation-a"
+    )
+    opensearch_payload = json.loads(opensearch_route.calls[0].request.content)
+    assert opensearch_report["count"] == 1
+    assert opensearch_report["published_count"] == 1
+    assert "text" not in opensearch_payload["_source"]
+    await opensearch.close()

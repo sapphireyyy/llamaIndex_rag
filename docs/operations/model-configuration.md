@@ -22,6 +22,11 @@ MODEL_API_KEY=replace-with-a-real-secret
 兼容端点必须提供 `POST /chat/completions`，并返回 `choices[0].message.content`。若响应中存在
 `usage.prompt_tokens` 和 `usage.completion_tokens`，系统会将其写入遥测指标。
 
+支持两种回答交付模式：Provider 声明 `streaming` 能力时，系统解析 SSE `delta`、结束原因
+和最终 usage；否则使用 `buffered`，完整回答通过一次 `answer` 事件发送。首个 delta 之前
+允许按策略重试或回退，首个 delta 之后的连接错误只产生一个失败终态，不会拼接第二个
+Provider 的回答。需要跨段敏感信息判断的策略应明确选择 `buffered`。
+
 ## DeepSeek 示例
 
 DeepSeek 使用 OpenAI 兼容接口，可以采用下列环境变量名称：
@@ -41,4 +46,5 @@ DEEPSEEK_API_KEY=replace-with-a-real-secret
 `RAG_QUERY_RATE_LIMIT_PER_MINUTE` 和 `RAG_QUERY_CONCURRENCY_LIMIT` 约束。
 
 开发环境中，远端模型网关保留本地抽取式模型作为可选回退；生产环境不自动回退，避免将远端
-模型故障误判为真实生成结果。
+模型故障误判为真实生成结果。生产配置必须绑定显式生成式 Provider Profile；禁止把 API
+密钥、密码或 token 放进 Provider 配置、助手版本或租户配置，只能引用 Secret Binding。

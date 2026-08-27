@@ -61,6 +61,13 @@ def _resources(request: Request) -> tuple[async_sessionmaker[AsyncSession], Adap
     return container.sessions, container.registry
 
 
+def _assistant_service(
+    request: Request, session: AsyncSession, registry: AdapterRegistry
+) -> AssistantService:
+    """Pass the runtime environment into assistant validation and publishing."""
+    return AssistantService(session, registry, request.app.state.settings.environment)
+
+
 def _draft(payload: AssistantDraftInput) -> AssistantDraft:
     """把 Pydantic 请求模型转换为应用层助手草稿对象。"""
     return AssistantDraft(
@@ -168,7 +175,7 @@ async def list_assistants(request: Request, identity: Identity) -> dict[str, obj
     """列出当前租户的助手及其活动版本。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        records = await AssistantService(session, registry).list_assistants(identity)
+        records = await _assistant_service(request, session, registry).list_assistants(identity)
         return {
             "items": [
                 {
@@ -188,7 +195,7 @@ async def create_assistant(
     """创建助手和第一版草稿配置。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        assistant, version = await AssistantService(session, registry).create_assistant(
+        assistant, version = await _assistant_service(request, session, registry).create_assistant(
             identity, payload.name, _draft(payload.draft)
         )
         await session.commit()
@@ -202,7 +209,7 @@ async def create_assistant_version(
     """为既有助手创建新的不可变草稿版本。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        version = await AssistantService(session, registry).create_draft(
+        version = await _assistant_service(request, session, registry).create_draft(
             identity, assistant_id, _draft(payload)
         )
         await session.commit()
@@ -216,7 +223,9 @@ async def assistant_history(
     """返回助手的版本历史，供校验和发布流程选择版本。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        versions = await AssistantService(session, registry).history(identity, assistant_id)
+        versions = await _assistant_service(request, session, registry).history(
+            identity, assistant_id
+        )
         return {"items": [_version_view(item) for item in versions]}
 
 
@@ -227,11 +236,12 @@ async def validate_assistant_version(
     """校验助手版本引用的空间、策略和供应商是否完整且同租户。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        versions = await AssistantService(session, registry).history(identity, assistant_id)
+        service = _assistant_service(request, session, registry)
+        versions = await service.history(identity, assistant_id)
         version = next((item for item in versions if item.id == version_id), None)
         if version is None:
             raise AppError(ErrorCategory.NOT_FOUND, "Resource not found.", 404)
-        errors = await AssistantService(session, registry).validate_version(identity, version)
+        errors = await service.validate_version(identity, version)
         await session.commit()
         return {"valid": not errors, "errors": errors}
 
@@ -243,7 +253,7 @@ async def activate_assistant_version(
     """激活通过校验的助手版本，并记录发布关联标识。"""
     sessions, registry = _resources(request)
     async with sessions() as session:
-        version = await AssistantService(session, registry).activate(
+        version = await _assistant_service(request, session, registry).activate(
             identity, assistant_id, version_id, request.state.correlation_id
         )
         await session.commit()

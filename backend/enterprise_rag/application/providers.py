@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from opentelemetry import trace
 
-from enterprise_rag.application.ports import ModelAdapter, ModelResponse, ModelUsage
+from enterprise_rag.application.ports import ModelAdapter, ModelDelta, ModelResponse, ModelUsage
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +59,7 @@ class AdapterRegistry:
 class ExtractiveModelAdapter:
     """无凭证本地回答器：直接抽取已授权上下文，仅用于开发与测试。"""
 
-    capabilities = frozenset({"completion", "streaming", "grounded-context", "local"})
+    capabilities = frozenset({"completion", "grounded-context", "local"})
 
     async def complete(self, system: str, user: str, context: str) -> ModelResponse:
         """忽略远端模型调用，从上下文生成可重复的确定性回答。"""
@@ -71,13 +72,13 @@ class ExtractiveModelAdapter:
         )
 
     def stream(self, system: str, user: str, context: str) -> AsyncIterator[str]:
-        """把抽取式回答按词切分为异步输出片段。"""
+        """抽取式 Provider 不伪报 streaming 能力，调用流式接口时明确失败。"""
+        del system, user, context
 
         async def iterator() -> AsyncIterator[str]:
-            """等待完整回答后按空格切分输出。"""
-            response = await self.complete(system, user, context)
-            for token in response.text.split(" "):
-                yield token + " "
+            """保留旧端口但不把完整回答伪装成增量流。"""
+            raise RuntimeError("extractive provider does not support true streaming")
+            yield ""
 
         return iterator()
 
@@ -138,14 +139,90 @@ class OpenAICompatibleModelAdapter:
             provider=f"openai-compatible:{self.model}",
         )
 
+    def stream_events(
+        self, system: str, user: str, context: str
+    ) -> AsyncIterator[ModelDelta]:
+        """请求 OpenAI-compatible SSE，并逐条返回真实 delta 与最终 usage。"""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": f"问题: {user}\n\n已授权证据:\n{context}",
+                },
+            ],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        async def iterator() -> AsyncIterator[ModelDelta]:
+            """保持 HTTP 流连接直到终端事件或异常。"""
+            finished = False
+            async with (
+                httpx.AsyncClient(timeout=self.timeout_seconds) as client,
+                client.stream(
+                    "POST",
+                    f"{self.api_base}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response,
+            ):
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if raw == "[DONE]":
+                            if not finished:
+                                finished = True
+                                yield ModelDelta(
+                                    finish_reason="stop",
+                                    provider=f"openai-compatible:{self.model}",
+                                )
+                            break
+                        try:
+                            value = json.loads(raw)
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError("invalid model SSE payload") from exc
+                        choices = value.get("choices", [])
+                        choice = choices[0] if isinstance(choices, list) and choices else {}
+                        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                        content = delta.get("content", "") if isinstance(delta, dict) else ""
+                        if isinstance(content, list):
+                            content = "".join(
+                                str(item.get("text", ""))
+                                for item in content
+                                if isinstance(item, dict)
+                            )
+                        if not isinstance(content, str):
+                            content = ""
+                        finish_reason = (
+                            choice.get("finish_reason") if isinstance(choice, dict) else None
+                        )
+                        usage_value = value.get("usage")
+                        usage = _usage_from_payload(usage_value)
+                        if finish_reason is not None:
+                            finished = True
+                        if content or finish_reason is not None or usage is not None:
+                            yield ModelDelta(
+                                text=content,
+                                finish_reason=str(finish_reason) if finish_reason else None,
+                                usage=usage,
+                                provider=f"openai-compatible:{self.model}",
+                            )
+
+        return iterator()
+
     def stream(self, system: str, user: str, context: str) -> AsyncIterator[str]:
-        """复用完整调用结果，提供兼容的异步分片输出接口。"""
+        """将真实 SSE 的文本 delta 暴露给旧的字符串流端口。"""
 
         async def iterator() -> AsyncIterator[str]:
-            """等待远端回答后按词切分输出。"""
-            response = await self.complete(system, user, context)
-            for token in response.text.split():
-                yield f"{token} "
+            """逐个转发远端 delta，不重组完整回答。"""
+            async for event in self.stream_events(system, user, context):
+                if event.text:
+                    yield event.text
 
         return iterator()
 
@@ -293,20 +370,110 @@ class ModelGateway:
     def stream(
         self, system: str, user: str, context: str, allow_fallback: bool = False
     ) -> AsyncIterator[str]:
-        """复用完整生成结果，按词提供异步流式输出。"""
+        """通过真实 delta 流提供兼容的字符串迭代器。"""
 
         async def iterator() -> AsyncIterator[str]:
-            """通过模型网关生成回答并逐词转发。"""
-            response = await self.complete(system, user, context, allow_fallback)
-            for token in response.text.split():
-                yield f"{token} "
+            """只转发模型增量，不从完整回答切词。"""
+            async for event in self.stream_events(system, user, context, allow_fallback):
+                if event.text:
+                    yield event.text
 
         return iterator()
+
+    def stream_events(
+        self,
+        system: str,
+        user: str,
+        context: str,
+        allow_fallback: bool = False,
+    ) -> AsyncIterator[ModelDelta]:
+        """首个 delta 前允许重试/回退，首个 delta 后任何失败都原样终止。"""
+
+        async def iterator() -> AsyncIterator[ModelDelta]:
+            self._check_rate_limit()
+            async with self._semaphore:
+                emitted = False
+                last_error: Exception | None = None
+                for attempt in range(self.retries + 1):
+                    try:
+                        async for event in self._adapter_stream(
+                            self.primary, system, user, context
+                        ):
+                            if event.text:
+                                emitted = True
+                            if event.usage is not None:
+                                self._record_usage(event.usage)
+                            yield event
+                        self.circuit = CircuitState()
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        if emitted:
+                            raise
+                        last_error = exc
+                        self.circuit.failures += 1
+                        if self.circuit.failures >= self.failure_threshold:
+                            self.circuit.opened_at = time.monotonic()
+                        if attempt < self.retries:
+                            await asyncio.sleep(min(2**attempt * 0.1, 1.0))
+                if allow_fallback and self.fallback is not None:
+                    async for event in self._adapter_stream(
+                        self.fallback, system, user, context
+                    ):
+                        if event.text:
+                            emitted = True
+                        if event.usage is not None:
+                            self._record_usage(event.usage)
+                        yield event
+                    return
+                raise RuntimeError("model streaming request failed") from last_error
+
+        return iterator()
+
+    @staticmethod
+    def _adapter_stream(
+        adapter: ModelAdapter,
+        system: str,
+        user: str,
+        context: str,
+    ) -> AsyncIterator[ModelDelta]:
+        """把真实 Provider 流或兼容字符串流统一成 ModelDelta。"""
+        stream_events = getattr(adapter, "stream_events", None)
+        if callable(stream_events):
+            stream_factory = cast(
+                Callable[[str, str, str], AsyncIterator[ModelDelta]], stream_events
+            )
+            return stream_factory(system, user, context)
+        if "streaming" not in getattr(adapter, "capabilities", frozenset()):
+            raise RuntimeError("model provider does not support true streaming")
+
+        async def iterator() -> AsyncIterator[ModelDelta]:
+            async for chunk in adapter.stream(system, user, context):
+                yield ModelDelta(text=chunk, provider=type(adapter).__name__)
+
+        return iterator()
+
+
+def _usage_from_payload(value: object) -> ModelUsage | None:
+    """把兼容服务的 usage 对象转换为领域用量。"""
+    if not isinstance(value, dict):
+        return None
+    prompt = value.get("prompt_tokens", 0)
+    completion = value.get("completion_tokens", 0)
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return None
+    return ModelUsage(prompt, completion, None)
 
 
 def default_registry() -> AdapterRegistry:
     """构造开发和生产共用的默认适配器注册表。"""
     from enterprise_rag.application.guardrails import BuiltinGuardrails
+    from enterprise_rag.infrastructure.ocr import (
+        DeterministicOCRAdapter,
+        NoopOCRAdapter,
+        TesseractOCRAdapter,
+    )
     from enterprise_rag.infrastructure.parsers import AllowListParser
     from enterprise_rag.infrastructure.search import (
         DeterministicEmbedding,
@@ -338,6 +505,18 @@ def default_registry() -> AdapterRegistry:
             "allowlist", "parser",
             frozenset({"structure", "pages", "sections", "tables"}),
             lambda config: AllowListParser(),
+        ),
+        AdapterDescriptor(
+            "none", "ocr", NoopOCRAdapter.capabilities,
+            lambda config: NoopOCRAdapter(),
+        ),
+        AdapterDescriptor(
+            "deterministic", "ocr", DeterministicOCRAdapter.capabilities,
+            lambda config: DeterministicOCRAdapter(),
+        ),
+        AdapterDescriptor(
+            "tesseract", "ocr", TesseractOCRAdapter.capabilities,
+            lambda config: TesseractOCRAdapter(str(config.get("language", "chi_sim+eng"))),
         ),
         AdapterDescriptor(
             "deterministic", "embedding", frozenset({"batch", "local"}),

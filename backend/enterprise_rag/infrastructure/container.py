@@ -9,7 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from enterprise_rag.application.guardrails import BuiltinGuardrails
-from enterprise_rag.application.ports import MessageQueue, ModelAdapter, ObjectStore, SearchAdapter
+from enterprise_rag.application.ports import (
+    MessageQueue,
+    ModelAdapter,
+    ObjectStore,
+    OCRAdapter,
+    SearchAdapter,
+)
 from enterprise_rag.application.providers import (
     AdapterRegistry,
     ExtractiveModelAdapter,
@@ -32,6 +38,7 @@ from enterprise_rag.infrastructure.database import (
 )
 from enterprise_rag.infrastructure.limits import SlidingWindowRateLimiter
 from enterprise_rag.infrastructure.object_store import FileSystemObjectStore, S3ObjectStore
+from enterprise_rag.infrastructure.ocr import NoopOCRAdapter
 from enterprise_rag.infrastructure.orm import (
     GroupRecord,
     PrincipalGroupRecord,
@@ -42,6 +49,7 @@ from enterprise_rag.infrastructure.orm import (
 )
 from enterprise_rag.infrastructure.parsers import AllowListParser
 from enterprise_rag.infrastructure.queue import InProcessQueue, RabbitMQQueue
+from enterprise_rag.infrastructure.rls import RLSPreflightError, postgres_rls_preflight
 from enterprise_rag.infrastructure.search import (
     DeterministicEmbedding,
     MemoryLexicalSearch,
@@ -66,6 +74,7 @@ class Container:
     coordination: MemoryCoordinationStore | RedisCoordinationStore | None = None
     registry: AdapterRegistry | None = None
     parser: AllowListParser | None = None
+    ocr: OCRAdapter | None = None
     embedding: DeterministicEmbedding | None = None
     dense_index: SearchAdapter | None = None
     lexical_index: SearchAdapter | None = None
@@ -83,6 +92,16 @@ class Container:
             raise RuntimeError("invalid runtime configuration: " + "; ".join(problems))
         self.engine = create_engine(self.settings.database_url)
         self.sessions = create_session_factory(self.engine)
+        if self.settings.environment == "production":
+            try:
+                await postgres_rls_preflight(
+                    self.engine, self.settings.database_runtime_role
+                )
+            except RLSPreflightError as exc:
+                await self.engine.dispose()
+                self.engine = None
+                self.sessions = None
+                raise RuntimeError(str(exc)) from exc
         secrets = EnvironmentSecretStore()
         if self.settings.object_store_backend == "s3":
             self.object_store = S3ObjectStore(
@@ -115,6 +134,7 @@ class Container:
         await self.coordination.start()
         self.registry = default_registry()
         self.parser = AllowListParser()
+        self.ocr = NoopOCRAdapter()
         self.embedding = DeterministicEmbedding()
         if self.settings.vector_backend == "qdrant":
             self.dense_index = QdrantVectorSearch(
@@ -313,11 +333,20 @@ class Container:
             check = getattr(component, "health", None)
             return bool(await check()) if check is not None else True
 
+        rls_ready = True
+        if self.settings.environment == "production" and self.engine is not None:
+            try:
+                await postgres_rls_preflight(
+                    self.engine, self.settings.database_runtime_role
+                )
+            except RLSPreflightError:
+                rls_ready = False
         return {
             "configuration": not self.settings.validate_runtime(),
             "tenant_bootstrap": not await self.bootstrap_problems(),
             "object_store": await healthy(self.object_store),
             "database": self.engine is not None and await check_database(self.engine),
+            "rls": rls_ready,
             "queue": await healthy(self.queue),
             "cache": await healthy(self.coordination),
             "vector_search": await healthy(self.dense_index),

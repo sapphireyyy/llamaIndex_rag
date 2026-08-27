@@ -4,19 +4,67 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractQueue, AbstractRobustConnection
 from opentelemetry import trace
-from sqlalchemy import Select, select
+from sqlalchemy import Select, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_rag.domain.types import JobMessage, new_id, utc_now
 from enterprise_rag.infrastructure.orm import OutboxRecord
+from enterprise_rag.infrastructure.telemetry import record_outbox_event, record_queue_delivery
+
+
+class QueueDelivery:
+    """统一进程内和 RabbitMQ 消息的显式确认生命周期。"""
+
+    def __init__(
+        self,
+        message: JobMessage,
+        *,
+        ack_callback: Callable[[], Awaitable[None]] | None = None,
+        nack_callback: Callable[[bool], Awaitable[None]] | None = None,
+        done_callback: Callable[[], None] | None = None,
+    ) -> None:
+        """保存消息和底层队列的确认/拒绝回调。"""
+        self.message = message
+        self._ack_callback = ack_callback
+        self._nack_callback = nack_callback
+        self._done_callback = done_callback
+        self._settled = False
+        self._started_at = time.perf_counter()
+
+    def __getattr__(self, name: str) -> Any:
+        """向后兼容旧的直接读取 delivery.id 等消息字段。"""
+        return getattr(self.message, name)
+
+    async def ack(self) -> None:
+        """在业务事务提交后确认消息，并只结算一次队列任务。"""
+        if self._settled:
+            return
+        if self._ack_callback is not None:
+            await self._ack_callback()
+        self._settled = True
+        if self._done_callback is not None:
+            self._done_callback()
+        record_queue_delivery(self.message.kind, "ack", time.perf_counter() - self._started_at)
+
+    async def nack(self, *, requeue: bool = True) -> None:
+        """拒绝消息；底层队列决定是否重新投递。"""
+        if self._settled:
+            return
+        if self._nack_callback is not None:
+            await self._nack_callback(requeue)
+        self._settled = True
+        if self._done_callback is not None:
+            self._done_callback()
+        record_queue_delivery(self.message.kind, "nack", time.perf_counter() - self._started_at)
 
 
 class InProcessQueue:
@@ -38,18 +86,29 @@ class InProcessQueue:
         self._sequence += 1
         await self._queue.put((-message.priority, self._sequence, message))
 
-    async def get(self) -> JobMessage:
-        """获取下一条待处理消息。"""
+    async def get(self) -> QueueDelivery:
+        """获取下一条待处理消息，但不自动确认。"""
         _, _, message = await self._queue.get()
-        return message
+        async def requeue(should_requeue: bool) -> None:
+            """按统一 delivery 语义重新投递未超限消息。"""
+            if should_requeue and message.attempt + 1 < message.max_attempts:
+                await self.publish(
+                    replace(message, id=new_id("retry"), attempt=message.attempt + 1)
+                )
+
+        return QueueDelivery(
+            message,
+            nack_callback=requeue,
+            done_callback=self.task_done,
+        )
 
     def task_done(self) -> None:
         """标记当前队列任务已完成。"""
         self._queue.task_done()
 
-    def consume(self) -> AsyncIterator[JobMessage]:
-        """持续生成待处理的队列消息。"""
-        async def iterator() -> AsyncIterator[JobMessage]:
+    def consume(self) -> AsyncIterator[QueueDelivery]:
+        """持续生成待处理的 delivery，调用方必须显式 ACK/NACK。"""
+        async def iterator() -> AsyncIterator[QueueDelivery]:
             """持续等待并产出进程内队列消息。"""
             while True:
                 yield await self.get()
@@ -141,19 +200,28 @@ class RabbitMQQueue:
             outgoing, routing_key=self.queue_name, mandatory=True
         )
 
-    async def get(self, timeout: float = 10.0) -> JobMessage:
-        """获取下一条待处理消息。"""
+    async def get(self, timeout: float = 10.0) -> QueueDelivery:
+        """获取一条尚未确认的 RabbitMQ delivery。"""
         if self._queue is None:
             raise RuntimeError("RabbitMQ queue is not started")
         incoming = await self._queue.get(timeout=timeout, fail=False)
         if incoming is None:
             raise TimeoutError("RabbitMQ queue receive timed out")
-        async with incoming.process(requeue=True):
-            return self._decode(incoming.body)
+        message = self._decode(incoming.body)
 
-    def consume(self) -> AsyncIterator[JobMessage]:
-        """持续生成待处理的队列消息。"""
-        async def iterator() -> AsyncIterator[JobMessage]:
+        async def acknowledge() -> None:
+            """在业务提交之后才向 RabbitMQ 发送 ACK。"""
+            await incoming.ack()
+
+        async def reject(requeue: bool) -> None:
+            """把失败任务交回 RabbitMQ，由 broker 决定再次投递。"""
+            await incoming.nack(requeue=requeue)
+
+        return QueueDelivery(message, ack_callback=acknowledge, nack_callback=reject)
+
+    def consume(self) -> AsyncIterator[QueueDelivery]:
+        """持续生成尚未确认的 RabbitMQ delivery。"""
+        async def iterator() -> AsyncIterator[QueueDelivery]:
             """持续等待并产出 RabbitMQ 队列消息。"""
             while True:
                 yield await self.get()
@@ -215,57 +283,139 @@ class OutboxDispatcher:
         """保存会话工厂和实际消息发布函数。"""
         self.session_factory = session_factory
         self.publish = publish
+        self.dispatcher_id = new_id("outbox-dispatcher")
+        self.claim_seconds = 60
 
-    def _pending_statement(self, limit: int) -> Select[tuple[OutboxRecord]]:
+    def _pending_statement(
+        self, limit: int, tenant_id: str | None = None
+    ) -> Select[tuple[OutboxRecord]]:
         """构建查询待投递事件的语句。"""
+        conditions = [
+            OutboxRecord.published_at.is_(None),
+            OutboxRecord.poisoned_at.is_(None),
+            OutboxRecord.available_at <= utc_now(),
+            or_(
+                OutboxRecord.claimed_by.is_(None),
+                OutboxRecord.claim_expires_at <= utc_now(),
+            ),
+        ]
+        if tenant_id is not None:
+            conditions.append(OutboxRecord.tenant_id == tenant_id)
         return (
             select(OutboxRecord)
-            .where(
-                OutboxRecord.published_at.is_(None),
-                OutboxRecord.poisoned_at.is_(None),
-                OutboxRecord.available_at <= utc_now(),
-            )
+            .where(*conditions)
             .order_by(OutboxRecord.priority.desc(), OutboxRecord.created_at)
             .limit(limit)
+            .with_for_update(skip_locked=True)
         )
 
-    async def dispatch_batch(self, limit: int = 100) -> tuple[int, int]:
+    async def dispatch_batch(
+        self, limit: int = 100, *, tenant_id: str | None = None
+    ) -> tuple[int, int]:
         """批量投递发件箱事件并记录结果。"""
         published = 0
         poisoned = 0
+        claimed: list[dict[str, Any]] = []
         async with self.session_factory() as session:
-            records = list((await session.scalars(self._pending_statement(limit))).all())
+            if tenant_id is not None:
+                from enterprise_rag.infrastructure.database import set_transaction_tenant
+
+                await set_transaction_tenant(session, tenant_id)
+            records = list(
+                (await session.scalars(self._pending_statement(limit, tenant_id))).all()
+            )
+            claim_until = utc_now() + timedelta(seconds=self.claim_seconds)
             for record in records:
-                message = JobMessage(
-                    id=record.id,
-                    kind=record.kind,
-                    tenant_id=record.tenant_id,
-                    correlation_id=record.correlation_id,
-                    payload=record.payload,
-                    priority=record.priority,
-                    attempt=record.attempts,
-                    max_attempts=record.max_attempts,
+                record.claimed_by = self.dispatcher_id
+                record.claim_expires_at = claim_until
+                claimed.append(
+                    {
+                        "id": record.id,
+                        "kind": record.kind,
+                        "tenant_id": record.tenant_id,
+                        "correlation_id": record.correlation_id,
+                        "payload": dict(record.payload),
+                        "priority": record.priority,
+                        "attempts": record.attempts,
+                        "max_attempts": record.max_attempts,
+                    }
                 )
-                with trace.get_tracer("enterprise_rag.queue").start_as_current_span(
-                    "queue.dispatch"
-                ) as span:
-                    span.set_attribute("messaging.message.id", record.id)
-                    span.set_attribute("messaging.correlation_id", record.correlation_id)
-                    try:
-                        await self.publish(message)
-                        record.published_at = utc_now()
-                        published += 1
-                    except Exception:
-                        record.attempts += 1
-                        if record.attempts >= record.max_attempts:
-                            record.poisoned_at = utc_now()
-                            poisoned += 1
-                        else:
-                            record.available_at = utc_now() + timedelta(
-                                seconds=2**record.attempts
-                            )
-                await session.flush()
             await session.commit()
+        for claimed_record in claimed:
+            message = JobMessage(
+                id=str(claimed_record["id"]),
+                kind=str(claimed_record["kind"]),
+                tenant_id=str(claimed_record["tenant_id"]),
+                correlation_id=str(claimed_record["correlation_id"]),
+                payload=dict(claimed_record["payload"]),
+                priority=int(claimed_record["priority"]),
+                attempt=int(claimed_record["attempts"]),
+                max_attempts=int(claimed_record["max_attempts"]),
+            )
+            with trace.get_tracer("enterprise_rag.queue").start_as_current_span(
+                "queue.dispatch"
+            ) as span:
+                span.set_attribute("messaging.message.id", message.id)
+                span.set_attribute("messaging.correlation_id", message.correlation_id)
+                try:
+                    await self.publish(message)
+                    record_outbox_event("published")
+                    async with self.session_factory() as session:
+                        if tenant_id is not None:
+                            from enterprise_rag.infrastructure.database import (
+                                set_transaction_tenant,
+                            )
+
+                            await set_transaction_tenant(session, message.tenant_id)
+                        result = await session.execute(
+                            update(OutboxRecord)
+                            .where(
+                                OutboxRecord.id == message.id,
+                                OutboxRecord.claimed_by == self.dispatcher_id,
+                                OutboxRecord.published_at.is_(None),
+                            )
+                            .values(
+                                published_at=utc_now(),
+                                claimed_by=None,
+                                claim_expires_at=None,
+                            )
+                        )
+                        await session.commit()
+                        published += int(cast(Any, result).rowcount or 0)
+                except Exception:
+                    record_outbox_event(
+                        "retry" if message.attempt + 1 < message.max_attempts else "poisoned"
+                    )
+                    next_attempt = message.attempt + 1
+                    values: dict[str, Any] = {
+                        "attempts": next_attempt,
+                        "claimed_by": None,
+                        "claim_expires_at": None,
+                        "last_error": "queue publish failed",
+                    }
+                    if next_attempt >= message.max_attempts:
+                        values["poisoned_at"] = utc_now()
+                        poisoned += 1
+                    else:
+                        values["available_at"] = utc_now() + timedelta(
+                            seconds=2**next_attempt
+                        )
+                    async with self.session_factory() as session:
+                        if tenant_id is not None:
+                            from enterprise_rag.infrastructure.database import (
+                                set_transaction_tenant,
+                            )
+
+                            await set_transaction_tenant(session, message.tenant_id)
+                        await session.execute(
+                            update(OutboxRecord)
+                            .where(
+                                OutboxRecord.id == message.id,
+                                OutboxRecord.claimed_by == self.dispatcher_id,
+                            )
+                            .values(**values)
+                        )
+                        await session.commit()
         return published, poisoned
 
 
@@ -274,13 +424,18 @@ async def consume_with_retry(
     handler: Callable[[JobMessage], Awaitable[None]],
 ) -> None:
     """消费进程内队列，失败时按最大尝试次数重新入队。"""
-    async for message in queue.consume():
+    async for delivery in queue.consume():
+        message = delivery.message
         try:
             await handler(message)
         except Exception:
+            await delivery.nack(requeue=False)
             if message.attempt + 1 < message.max_attempts:
                 await queue.publish(
                     replace(message, id=new_id("retry"), attempt=message.attempt + 1)
                 )
-        finally:
-            queue.task_done()
+        except BaseException:
+            await delivery.nack(requeue=False)
+            raise
+        else:
+            await delivery.ack()

@@ -52,11 +52,24 @@ class AllowListParser:
         if extension == ".pdf":
             module = importlib.import_module("fitz")
             document = module.open(stream=content, filetype="pdf")
-            return [
-                ParsedUnit(page.get_text().strip(), index + 1, None, {"format": "pdf"})
-                for index, page in enumerate(document)
-                if page.get_text().strip()
-            ]
+            units: list[ParsedUnit] = []
+            try:
+                for index, page in enumerate(document):
+                    text = page.get_text().strip()
+                    metadata: dict[str, Any] = {
+                        "format": "pdf",
+                        "native_text_chars": len(text),
+                        "ocr_candidate": len(text) < 32,
+                    }
+                    page_image = None
+                    if len(text) < 32:
+                        # 保留扫描页的可供 OCR 输入, 即使原生文本为空。
+                        pixmap = page.get_pixmap(matrix=module.Matrix(1.5, 1.5), alpha=False)
+                        page_image = pixmap.tobytes("png")
+                    units.append(ParsedUnit(text, index + 1, None, metadata, page_image))
+            finally:
+                document.close()
+            return units
         if extension == ".docx":
             module = importlib.import_module("docx")
             document = module.Document(io.BytesIO(content))
@@ -64,18 +77,18 @@ class AllowListParser:
         if extension == ".pptx":
             module = importlib.import_module("pptx")
             presentation = module.Presentation(io.BytesIO(content))
-            units: list[ParsedUnit] = []
+            slide_units: list[ParsedUnit] = []
             for slide_number, slide in enumerate(presentation.slides, 1):
                 texts = [shape.text for shape in slide.shapes if hasattr(shape, "text")]
                 text = "\n".join(item.strip() for item in texts if item.strip())
                 if text:
-                    units.append(
+                    slide_units.append(
                         ParsedUnit(text, slide_number, f"Slide {slide_number}", {"format": "pptx"})
                     )
-            return units
+            return slide_units
         module = importlib.import_module("openpyxl")
         workbook = module.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        units = []
+        spreadsheet_units: list[ParsedUnit] = []
         for worksheet in workbook.worksheets:
             rows = [
                 "\t".join("" if value is None else str(value) for value in row)
@@ -83,8 +96,10 @@ class AllowListParser:
             ]
             text = "\n".join(row for row in rows if row.strip())
             if text:
-                units.append(ParsedUnit(text, None, worksheet.title, {"format": "xlsx"}))
-        return units
+                spreadsheet_units.append(
+                    ParsedUnit(text, None, worksheet.title, {"format": "xlsx"})
+                )
+        return spreadsheet_units
 
     @staticmethod
     def _parse_text(content: bytes) -> list[ParsedUnit]:

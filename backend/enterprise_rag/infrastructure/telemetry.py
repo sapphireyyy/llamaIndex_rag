@@ -51,6 +51,66 @@ PROVIDER_COST = Counter(
     ("provider",),
 )
 QUEUE_BACKLOG = Gauge("enterprise_rag_queue_backlog", "In-process queue backlog.")
+QUEUE_DELIVERIES = Counter(
+    "enterprise_rag_queue_deliveries_total",
+    "Queue deliveries settled by ACK or NACK.",
+    ("kind", "outcome"),
+)
+QUEUE_DELIVERY_LATENCY = Histogram(
+    "enterprise_rag_queue_delivery_duration_seconds",
+    "Time between delivery receipt and settlement.",
+    ("kind", "outcome"),
+)
+OUTBOX_EVENTS = Counter(
+    "enterprise_rag_outbox_events_total",
+    "Outbox publish outcomes.",
+    ("outcome",),
+)
+LEASE_EVENTS = Counter(
+    "enterprise_rag_worker_lease_events_total",
+    "Worker lease recovery outcomes.",
+    ("outcome",),
+)
+INGESTION_STAGES = Counter(
+    "enterprise_rag_ingestion_stages_total",
+    "Ingestion terminal and stage observations.",
+    ("stage", "status"),
+)
+OCR_PAGES = Counter(
+    "enterprise_rag_ocr_pages_total",
+    "OCR page outcomes.",
+    ("mode", "provider", "outcome"),
+)
+OCR_LATENCY = Histogram(
+    "enterprise_rag_ocr_page_duration_seconds",
+    "OCR page processing duration.",
+    ("provider",),
+)
+INDEX_GENERATIONS = Counter(
+    "enterprise_rag_index_generations_total",
+    "Index generation outcomes.",
+    ("outcome",),
+)
+RECONCILIATION_RESULTS = Counter(
+    "enterprise_rag_reconciliation_results_total",
+    "Index reconciliation outcomes.",
+    ("index", "status"),
+)
+STREAM_EVENTS = Counter(
+    "enterprise_rag_stream_events_total",
+    "Query stream terminal outcomes.",
+    ("delivery_mode", "outcome", "provider"),
+)
+STREAM_FIRST_DELTA = Histogram(
+    "enterprise_rag_stream_first_delta_seconds",
+    "Time from query start to first model delta.",
+    ("provider",),
+)
+STREAM_LATENCY = Histogram(
+    "enterprise_rag_stream_duration_seconds",
+    "End-to-end query stream duration.",
+    ("delivery_mode", "outcome"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,3 +219,64 @@ def record_query_metrics(status: str, usage: dict[str, object]) -> None:
         PROVIDER_TOKENS.labels(provider=provider, direction="output").inc(output_tokens)
     if isinstance(cost, (int, float)):
         PROVIDER_COST.labels(provider=provider).inc(cost)
+
+
+def record_queue_delivery(kind: str, outcome: str, duration_seconds: float) -> None:
+    """Record ACK/NACK settlement without retaining message content."""
+    QUEUE_DELIVERIES.labels(kind=kind, outcome=outcome).inc()
+    QUEUE_DELIVERY_LATENCY.labels(kind=kind, outcome=outcome).observe(duration_seconds)
+
+
+def record_outbox_event(outcome: str) -> None:
+    """Record an outbox publish, retry, or poison outcome."""
+    OUTBOX_EVENTS.labels(outcome=outcome).inc()
+
+
+def record_lease_event(outcome: str, count: int = 1) -> None:
+    """Record lease recovery or lease-loss observations."""
+    if count > 0:
+        LEASE_EVENTS.labels(outcome=outcome).inc(count)
+
+
+def record_ingestion_stage(stage: str, status: str) -> None:
+    """Record a non-sensitive ingestion stage observation."""
+    INGESTION_STAGES.labels(stage=stage, status=status).inc()
+
+
+def record_ocr_page(
+    mode: str, provider: str, outcome: str, elapsed_ms: float | None = None
+) -> None:
+    """Record OCR outcome and optional provider duration."""
+    OCR_PAGES.labels(mode=mode, provider=provider, outcome=outcome).inc()
+    if elapsed_ms is not None:
+        OCR_LATENCY.labels(provider=provider).observe(max(elapsed_ms, 0.0) / 1000)
+
+
+def record_index_generation(outcome: str) -> None:
+    """Record index generation publication or rollback outcome."""
+    INDEX_GENERATIONS.labels(outcome=outcome).inc()
+
+
+def record_reconciliation(index: str, status: str) -> None:
+    """Record per-index reconciliation status without indexing document content."""
+    RECONCILIATION_RESULTS.labels(index=index, status=status).inc()
+
+
+def record_stream_metrics(
+    delivery_mode: str,
+    outcome: str,
+    provider: str,
+    duration_seconds: float,
+    first_delta_seconds: float | None = None,
+) -> None:
+    """Record streaming/buffered timing and terminal outcome."""
+    STREAM_EVENTS.labels(
+        delivery_mode=delivery_mode, outcome=outcome, provider=provider
+    ).inc()
+    STREAM_LATENCY.labels(
+        delivery_mode=delivery_mode, outcome=outcome
+    ).observe(max(duration_seconds, 0.0))
+    if first_delta_seconds is not None:
+        STREAM_FIRST_DELTA.labels(provider=provider).observe(
+            max(first_delta_seconds, 0.0)
+        )

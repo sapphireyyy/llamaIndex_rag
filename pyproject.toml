@@ -40,6 +40,10 @@ providers = [
   "qdrant-client>=1.15,<2",
   "redis>=6,<7",
 ]
+ocr = [
+  "pillow>=11,<12",
+  "pytesseract>=0.3.13,<1",
+]
 
 [project.scripts]
 enterprise-rag-bootstrap = "enterprise_rag.cli.bootstrap_tenants:main"

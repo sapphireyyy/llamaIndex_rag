@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from enterprise_rag.api.auth import Identity
 from enterprise_rag.api.errors import AppError
+from enterprise_rag.application.assistants import AssistantService
 from enterprise_rag.application.guardrails import BuiltinGuardrails
 from enterprise_rag.application.ingestion import IngestionService
 from enterprise_rag.application.ports import (
@@ -24,7 +25,7 @@ from enterprise_rag.application.ports import (
     SearchAdapter,
 )
 from enterprise_rag.application.providers import AdapterRegistry, ModelGateway
-from enterprise_rag.application.query import QueryService
+from enterprise_rag.application.query import QUERY_CANCELLATIONS, QueryService
 from enterprise_rag.application.retrieval import RetrievalService
 from enterprise_rag.application.security import DatabaseAuthorizationService
 from enterprise_rag.application.tenant_limits import tenant_operation_lease
@@ -83,6 +84,7 @@ def _query_service(request: Request, session: AsyncSession) -> QueryService:
         retrieval,
         cast(ModelGateway, container.model_gateway),
         cast(BuiltinGuardrails, container.guardrails),
+        request.app.state.settings.environment,
     )
 
 
@@ -93,111 +95,88 @@ def _sse(event: str, payload: Mapping[str, object]) -> str:
 
 @router.post("/chat/query")
 async def query(request: Request, payload: QueryInput, identity: Identity) -> StreamingResponse:
-    """执行一次受限流保护的问答，并把答案和引用按 SSE 分块返回。"""
+    """执行一次受限流保护的问答，并按真实增量或 buffered SSE 返回。"""
     container = request.app.state.container
     if container.coordination is None or container.query_slots is None:
         raise AppError(ErrorCategory.DEPENDENCY_UNAVAILABLE, "Query controls unavailable.", 503)
-    async with (
-        tenant_operation_lease(
-            _sessions(request), container.coordination, identity, "query"
-        ),
-        container.query_slots,
-        _sessions(request)() as session,
-    ):
-        conversation, execution, answer, citations = await _query_service(
-            request, session
-        ).execute(
-            identity,
-            payload.assistant_id,
-            payload.question,
-            request.state.correlation_id,
-            payload.conversation_id,
+    sessions = _sessions(request)
+    if container.registry is None:
+        raise AppError(ErrorCategory.DEPENDENCY_UNAVAILABLE, "Query service unavailable.", 503)
+    async with sessions() as preflight_session:
+        snapshot = await AssistantService(
+            preflight_session,
+            cast(AdapterRegistry, container.registry),
+            request.app.state.settings.environment,
+        ).get_active_snapshot(identity, payload.assistant_id)
+        await DatabaseAuthorizationService(sessions).retrieval_scope(
+            identity, snapshot.knowledge_space_ids
         )
-        await TelemetryService(
-            session,
-            request.app.state.settings.content_capture_enabled,
-            request.app.state.settings.telemetry_sample_rate,
-        ).record(
-            TelemetryInput(
-                identity.tenant_id,
-                request.state.correlation_id,
-                "query",
-                "terminal",
-                answer.status,
-                attributes={
-                    "query_id": execution.id,
-                    "assistant_version_id": execution.assistant_version_id,
-                    "component_versions": execution.component_versions,
-                    "usage": execution.usage,
-                },
-                content={"question": payload.question, "answer": answer.text},
-            )
-        )
-        await session.commit()
-        query_id = execution.id
-        answer_id = answer.id
-        conversation_id = conversation.id
-        answer_text = answer.text
-        terminal_status = answer.status
-        execution.status = "streaming"
-        await session.commit()
-        citation_payloads = [
-            {
-                "id": item.id,
-                "label": item.label,
-                "page": item.page,
-                "section": item.section,
-                "source_url": f"/api/v1/citations/{item.id}/source",
-            }
-            for item in citations
-        ]
 
     async def events() -> AsyncIterator[str]:
-        """逐步发送查询、答案、引用和终止状态，同时响应取消或断开。"""
-        async def current_status() -> str | None:
-            """读取数据库中的查询状态，以便流式输出感知取消请求。"""
-            async with _sessions(request)() as status_session:
-                status = await status_session.scalar(
-                    select(QueryExecutionRecord.status).where(
-                        QueryExecutionRecord.id == query_id,
-                        QueryExecutionRecord.tenant_id == identity.tenant_id,
+        """在保持数据库和租户并发租约的同时转发应用层查询事件。"""
+        async with (
+            tenant_operation_lease(
+                sessions, container.coordination, identity, "query"
+            ),
+            container.query_slots,
+            sessions() as session,
+        ):
+            service = _query_service(request, session)
+            query_id: str | None = None
+            async for item in service.execute_stream(
+                identity,
+                payload.assistant_id,
+                payload.question,
+                request.state.correlation_id,
+                payload.conversation_id,
+            ):
+                if item.name == "query":
+                    query_id = str(item.payload["query_id"])
+                if await request.is_disconnected():
+                    if query_id is not None:
+                        QUERY_CANCELLATIONS.cancel(query_id)
+                        execution = await session.scalar(
+                            select(QueryExecutionRecord).where(
+                                QueryExecutionRecord.id == query_id,
+                                QueryExecutionRecord.tenant_id == identity.tenant_id,
+                            )
+                        )
+                        if execution is not None and execution.status in {"running", "streaming"}:
+                            execution.status = "cancelled"
+                            await session.commit()
+                    return
+                if item.name == "terminal" and query_id is not None:
+                    execution = await session.scalar(
+                        select(QueryExecutionRecord).where(
+                            QueryExecutionRecord.id == query_id,
+                            QueryExecutionRecord.tenant_id == identity.tenant_id,
+                        )
                     )
-                )
-                return status
-
-        async def finish(status: str) -> None:
-            """把流式查询的最终状态持久化到查询执行记录。"""
-            async with _sessions(request)() as status_session:
-                execution_record = await status_session.scalar(
-                    select(QueryExecutionRecord).where(
-                        QueryExecutionRecord.id == query_id,
-                        QueryExecutionRecord.tenant_id == identity.tenant_id,
-                    )
-                )
-                if execution_record is not None:
-                    execution_record.status = status
-                    await status_session.commit()
-
-        yield _sse(
-            "query",
-            {
-                "query_id": query_id,
-                "answer_id": answer_id,
-                "conversation_id": conversation_id,
-            },
-        )
-        for offset in range(0, len(answer_text), 120):
-            if await request.is_disconnected():
-                await finish("cancelled")
-                return
-            if await current_status() == "cancelled":
-                yield _sse("terminal", {"status": "cancelled"})
-                return
-            yield _sse("answer", {"delta": answer_text[offset : offset + 120]})
-        for citation in citation_payloads:
-            yield _sse("citation", citation)
-        await finish(terminal_status)
-        yield _sse("terminal", {"status": terminal_status})
+                    if execution is not None:
+                        await TelemetryService(
+                            session,
+                            request.app.state.settings.content_capture_enabled,
+                            request.app.state.settings.telemetry_sample_rate,
+                        ).record(
+                            TelemetryInput(
+                                identity.tenant_id,
+                                request.state.correlation_id,
+                                "query",
+                                "terminal",
+                                str(item.payload.get("status", "failed")),
+                                attributes={
+                                    "query_id": execution.id,
+                                    "assistant_version_id": execution.assistant_version_id,
+                                    "component_versions": execution.component_versions,
+                                    "delivery_mode": execution.delivery_mode,
+                                    "policy_snapshot": execution.policy_snapshot,
+                                    "provider_snapshot": execution.provider_snapshot,
+                                    "usage": execution.usage,
+                                },
+                            )
+                        )
+                        await session.commit()
+                yield _sse(item.name, item.payload)
 
     return StreamingResponse(
         events(),
@@ -219,6 +198,7 @@ async def cancel_query(request: Request, query_id: str, identity: Identity) -> d
         if execution is None:
             raise AppError(ErrorCategory.NOT_FOUND, "Query not found.", 404)
         if execution.status in {"running", "streaming"}:
+            QUERY_CANCELLATIONS.cancel(query_id)
             execution.status = "cancelled"
             await session.commit()
         return {"id": execution.id, "status": execution.status}
@@ -267,7 +247,14 @@ async def citation_source(
             request.app.state.settings.max_upload_bytes,
         )
         await ingestion.require_document(identity, document.id)
-        if document.active_version_id != citation.document_version_id or not chunk.active:
+        if (
+            document.active_version_id != citation.document_version_id
+            or not chunk.active
+            or (
+                document.active_generation_id is not None
+                and chunk.index_generation_id != document.active_generation_id
+            )
+        ):
             raise AppError(ErrorCategory.NOT_FOUND, "Citation source is no longer active.", 404)
         return {
             "citation_id": citation.id,

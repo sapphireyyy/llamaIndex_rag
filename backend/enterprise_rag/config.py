@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     environment: Literal["development", "test", "staging", "production"] = "development"
     database_url: str = "sqlite+aiosqlite:///./enterprise_rag.db"
+    database_runtime_role: str = "enterprise_rag_app"
     object_store_backend: Literal["filesystem", "s3"] = "filesystem"
     object_store_root: Path = Path("./var/objects")
     s3_endpoint_url: str = "http://localhost:9000"
@@ -31,6 +32,8 @@ class Settings(BaseSettings):
     s3_access_key_reference: str = "env://MINIO_ROOT_USER"
     s3_secret_key_reference: str = "env://MINIO_ROOT_PASSWORD"
     queue_backend: Literal["inprocess", "rabbitmq"] = "inprocess"
+    ingestion_execution_mode: Literal["queued", "inline"] = "queued"
+    migration_database_url: str = ""
     rabbitmq_url_reference: str = "env://RABBITMQ_URL"
     rabbitmq_queue_name: str = "enterprise-rag-jobs"
     cache_backend: Literal["memory", "redis"] = "memory"
@@ -48,6 +51,8 @@ class Settings(BaseSettings):
     model_api_base: str = ""
     model_name: str = ""
     model_api_key_reference: str = "env://OPENAI_API_KEY"
+    model_provider_profile_id: str = ""
+    allow_extractive_fallback: bool = False
     oidc_enabled: bool = False
     oidc_issuer: str = ""
     oidc_audience: str = "enterprise-rag"
@@ -76,8 +81,16 @@ class Settings(BaseSettings):
     context_token_budget: int = 8_000
     upload_rate_limit_per_minute: int = 30
     query_rate_limit_per_minute: int = 60
+    worker_lease_seconds: int = 120
+    worker_heartbeat_seconds: int = 30
+    worker_poll_seconds: float = 1.0
+    outbox_poll_seconds: float = 1.0
+    job_retry_backoff_seconds: int = 2
+    orphan_object_retention_seconds: int = 86_400
+    index_generation_retention_seconds: int = 7 * 86_400
+    worker_tenant_ids: list[str] = Field(default_factory=list)
 
-    @field_validator("dev_groups", "allowed_origins", mode="before")
+    @field_validator("dev_groups", "allowed_origins", "worker_tenant_ids", mode="before")
     @classmethod
     def split_csv(cls, value: object) -> object:
         """把环境变量中的逗号分隔值转换成去空白后的列表。"""
@@ -132,6 +145,31 @@ class Settings(BaseSettings):
             problems.append("S3 object storage requires endpoint, bucket, and secret references")
         if self.queue_backend == "rabbitmq" and not self.rabbitmq_url_reference:
             problems.append("RabbitMQ requires a secret URL reference")
+        if (
+            self.ingestion_execution_mode == "inline"
+            and self.environment not in {"development", "test"}
+        ):
+            problems.append("inline ingestion is allowed only in development or test")
+        if self.environment == "production":
+            if not self.database_url.startswith("postgresql"):
+                problems.append("production requires PostgreSQL as the authoritative database")
+            if self.ingestion_execution_mode != "queued":
+                problems.append("production ingestion must use queued execution")
+            if self.queue_backend != "rabbitmq":
+                problems.append("production ingestion must use durable RabbitMQ")
+            if self.model_backend != "openai_compatible":
+                problems.append("production requires an explicit generative model provider")
+            if self.allow_extractive_fallback:
+                problems.append("extractive fallback must be disabled in production")
+            if not self.migration_database_url:
+                problems.append("production requires a separate migration database URL")
+            elif self.migration_database_url == self.database_url:
+                problems.append("migration and runtime database URLs must be separate")
+            if not self.database_runtime_role or self.database_runtime_role in {
+                "postgres",
+                "enterprise_rag",
+            }:
+                problems.append("production requires a non-owner database runtime role")
         if self.vector_backend == "qdrant" and not self.qdrant_url:
             problems.append("Qdrant requires a service URL")
         if self.vector_backend == "milvus" and not self.milvus_url:
@@ -147,6 +185,10 @@ class Settings(BaseSettings):
                 problems.append("OpenAI-compatible model requires a model name")
             if not self.model_api_key_reference.startswith("env://"):
                 problems.append("model API key must use an environment secret reference")
+        if self.worker_heartbeat_seconds >= self.worker_lease_seconds:
+            problems.append("worker heartbeat must be shorter than the lease")
+        if self.worker_poll_seconds <= 0 or self.outbox_poll_seconds <= 0:
+            problems.append("worker and outbox poll intervals must be positive")
         return problems
 
 

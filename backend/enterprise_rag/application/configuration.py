@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +36,23 @@ class ConfigurationService:
         """限制模型与策略配置变更只能由租户管理员执行。"""
         if Role.ADMINISTRATOR not in identity.roles:
             raise AppError(ErrorCategory.FORBIDDEN, "Operation is not permitted.", 403)
+
+    @staticmethod
+    def _contains_raw_secret(value: object, sensitive_keys: set[str]) -> bool:
+        """递归拒绝嵌套配置中的明文密钥，避免仅检查顶层字段。"""
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                if str(key).strip().lower() in sensitive_keys:
+                    return True
+                if ConfigurationService._contains_raw_secret(nested, sensitive_keys):
+                    return True
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(
+                ConfigurationService._contains_raw_secret(item, sensitive_keys)
+                for item in value
+            )
+        return False
 
     async def create_policy(
         self,
@@ -80,6 +99,29 @@ class ConfigurationService:
     ) -> ProviderProfileRecord:
         """校验适配器和密钥绑定后，保存供应商能力快照。"""
         self._require_admin(identity)
+        sensitive_keys = {
+            "password",
+            "secret",
+            "client_secret",
+            "api_key",
+            "access_token",
+            "refresh_token",
+            "private_key",
+        }
+        if self._contains_raw_secret(config, sensitive_keys):
+            raise AppError(
+                ErrorCategory.INVALID_REQUEST,
+                "Provider config must reference a secret binding, not contain a raw secret.",
+                422,
+            )
+        if adapter == "openai-compatible":
+            api_key_reference = str(config.get("api_key_reference") or "")
+            if api_key_reference and not api_key_reference.startswith("env://"):
+                raise AppError(
+                    ErrorCategory.INVALID_REQUEST,
+                    "Provider API keys must use an environment secret reference.",
+                    422,
+                )
         descriptor = self.registry.describe(kind, adapter)
         if descriptor is None:
             raise AppError(ErrorCategory.INVALID_REQUEST, "Provider adapter is unavailable.", 422)
@@ -89,6 +131,7 @@ class ConfigurationService:
                     select(func.count(SecretBindingRecord.id)).where(
                         SecretBindingRecord.tenant_id == identity.tenant_id,
                         SecretBindingRecord.id.in_(secret_binding_ids),
+                        SecretBindingRecord.valid.is_(True),
                     )
                 )
                 or 0
@@ -106,6 +149,16 @@ class ConfigurationService:
             capabilities=sorted(descriptor.capabilities),
             config=config,
             secret_binding_ids=secret_binding_ids,
+            profile_hash=stable_json_hash(
+                {
+                    "name": name.strip(),
+                    "kind": kind,
+                    "adapter": adapter,
+                    "capabilities": sorted(descriptor.capabilities),
+                    "config": config,
+                    "secret_binding_ids": sorted(set(secret_binding_ids)),
+                }
+            ),
         )
         self.session.add(profile)
         await self.session.flush()

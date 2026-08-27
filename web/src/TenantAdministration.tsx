@@ -193,6 +193,11 @@ function SettingsConsole({ tenant, notify }: { tenant: TenantSummary; notify: Pr
   const [timeZone, setTimeZone] = useState("Asia/Shanghai");
   const [retentionDays, setRetentionDays] = useState(365);
   const [warningPercent, setWarningPercent] = useState(80);
+  const [chunkSize, setChunkSize] = useState(512);
+  const [chunkOverlap, setChunkOverlap] = useState(64);
+  const [ocrMode, setOcrMode] = useState("disabled");
+  const [ocrMinTextChars, setOcrMinTextChars] = useState(32);
+  const [ocrProviderId, setOcrProviderId] = useState("");
 
   const refresh = useCallback(async () => {
     const [settingsResult, versionResult, usageResult] = await Promise.all([
@@ -203,8 +208,14 @@ function SettingsConsole({ tenant, notify }: { tenant: TenantSummary; notify: Pr
     setTimeZone(String(settingsResult.config.time_zone ?? "Asia/Shanghai"));
     const retention = settingsResult.config.retention as Record<string, unknown> | undefined;
     const quotas = settingsResult.config.quotas as Record<string, unknown> | undefined;
+    const ingestion = settingsResult.config.ingestion as Record<string, unknown> | undefined;
     setRetentionDays(Number(retention?.content_days ?? 365));
     setWarningPercent(Number(quotas?.warning_percent ?? 80));
+    setChunkSize(Number(ingestion?.chunk_size ?? 512));
+    setChunkOverlap(Number(ingestion?.chunk_overlap ?? 64));
+    setOcrMode(String(ingestion?.ocr_mode ?? "disabled"));
+    setOcrMinTextChars(Number(ingestion?.ocr_min_text_chars ?? 32));
+    setOcrProviderId(String(ingestion?.ocr_provider_id ?? ""));
   }, []);
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -217,7 +228,15 @@ function SettingsConsole({ tenant, notify }: { tenant: TenantSummary; notify: Pr
     event.preventDefault(); if (!effective) return;
     const retention = { ...(effective.config.retention as Record<string, unknown>), content_days: retentionDays };
     const quotas = { ...(effective.config.quotas as Record<string, unknown>), warning_percent: warningPercent };
-    try { await api.createTenantConfigurationVersion({ ...effective.config, locale, time_zone: timeZone, retention, quotas }, effective.tenant_revision, true); await refresh(); notify({ tone: "ok", text: "新配置版本已验证并激活。" }); }
+    const ingestion = {
+      ...(effective.config.ingestion as Record<string, unknown>),
+      chunk_size: chunkSize,
+      chunk_overlap: chunkOverlap,
+      ocr_mode: ocrMode,
+      ocr_min_text_chars: ocrMinTextChars,
+      ocr_provider_id: ocrProviderId || null,
+    };
+    try { await api.createTenantConfigurationVersion({ ...effective.config, locale, time_zone: timeZone, retention, quotas, ingestion }, effective.tenant_revision, true); await refresh(); notify({ tone: "ok", text: "新配置版本已验证并激活。" }); }
     catch (error) { notify({ tone: "error", text: `配置校验失败：${(error as Error).message}` }); }
   }
   async function rollback(version: TenantConfigurationVersion) {
@@ -225,7 +244,7 @@ function SettingsConsole({ tenant, notify }: { tenant: TenantSummary; notify: Pr
     try { await api.rollbackTenantConfiguration(version.id, effective.tenant_revision); await refresh(); notify({ tone: "ok", text: "回滚已创建为新的不可变版本。" }); }
     catch (error) { notify({ tone: "error", text: (error as Error).message }); }
   }
-  return <div className="content-stack"><section className="panel"><div className="panel-title"><div><h2>租户设置</h2><p>保存会创建完整、不可变的新版本；界面仅显示密钥绑定标识，不显示密钥值。</p></div><span className="mono">{effective?.config_hash.slice(0, 12)}</span></div><form className="settings-grid" onSubmit={save}><label>语言地区<input value={locale} onChange={(event) => setLocale(event.target.value)} required /></label><label>IANA 时区<input value={timeZone} onChange={(event) => setTimeZone(event.target.value)} required /></label><label>内容保留天数<input type="number" min="1" max="3650" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} /></label><label>配额预警阈值（%）<input type="number" min="1" max="100" value={warningPercent} onChange={(event) => setWarningPercent(Number(event.target.value))} /></label><button className="primary" disabled={!effective}>验证并激活新版本</button></form></section>
+  return <div className="content-stack"><section className="panel"><div className="panel-title"><div><h2>租户设置</h2><p>保存会创建完整、不可变的新版本；界面仅显示密钥绑定标识，不显示密钥值。</p></div><span className="mono">{effective?.config_hash.slice(0, 12)}</span></div><form className="settings-grid" onSubmit={save}><label>语言地区<input value={locale} onChange={(event) => setLocale(event.target.value)} required /></label><label>IANA 时区<input value={timeZone} onChange={(event) => setTimeZone(event.target.value)} required /></label><label>内容保留天数<input type="number" min="1" max="3650" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} /></label><label>配额预警阈值（%）<input type="number" min="1" max="100" value={warningPercent} onChange={(event) => setWarningPercent(Number(event.target.value))} /></label><label>切分窗口（token）<input type="number" min="32" max="8192" value={chunkSize} onChange={(event) => setChunkSize(Number(event.target.value))} /><small>默认 512；任务提交后固定使用当时版本。</small></label><label>切分重叠（token）<input type="number" min="0" max="2048" value={chunkOverlap} onChange={(event) => setChunkOverlap(Number(event.target.value))} /><small>必须小于切分窗口，默认 64。</small></label><label>扫描页 OCR<select value={ocrMode} onChange={(event) => setOcrMode(event.target.value)}><option value="disabled">关闭</option><option value="best_effort">尽力识别，失败保留原页</option><option value="required">必须成功，否则任务失败</option></select></label><label>OCR 最低文本阈值<input type="number" min="0" max="100000" value={ocrMinTextChars} onChange={(event) => setOcrMinTextChars(Number(event.target.value))} /></label><label>OCR Provider 标识<input value={ocrProviderId} onChange={(event) => setOcrProviderId(event.target.value)} placeholder="required 模式必填" /><small>只填写已注册的 Provider 标识，不填写密钥。</small></label><button className="primary" disabled={!effective}>验证并激活新版本</button></form></section>
     <section className="panel"><div className="panel-title"><div><h2>配额与用量</h2><p>预留量会在昂贵操作开始前计入；黄色项目已达到租户预警阈值。</p></div><button onClick={() => void api.reconcileTenantUsage().then(refresh)}>重新核对</button></div><div className="usage-grid">{usage.map((item) => { const total = item.used + item.reserved; const ratio = item.limit > 0 ? Math.min(100, total * 100 / item.limit) : 0; return <div className={`usage-card ${item.warning ? "warning" : ""}`} key={item.resource}><div><strong>{item.resource}</strong><span>{total.toLocaleString()} / {item.limit.toLocaleString()}</span></div><div className="usage-bar"><i style={{ width: `${ratio}%` }} /></div><small>已用 {item.used.toLocaleString()} · 预留 {item.reserved.toLocaleString()}</small></div>; })}</div></section>
     <section className="panel"><div className="panel-title"><h2>版本历史</h2></div><div className="timeline">{versions.map((version) => <div className="timeline-item" key={version.id}><div className="timeline-dot" /><div><strong>版本 {version.version}</strong> <Status value={version.state} /><p className="mono">{version.config_hash}</p>{version.validation_errors.length > 0 && <p className="error-text">{version.validation_errors.join("；")}</p>}</div><button disabled={version.id === effective?.configuration_version_id} onClick={() => void rollback(version)}>回滚到此版本</button></div>)}</div></section></div>;
 }

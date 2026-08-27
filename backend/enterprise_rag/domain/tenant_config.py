@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from enterprise_rag.domain.types import stable_json_hash
+
 
 class StrictConfigModel(BaseModel):
     """Base model that rejects unknown fields and mutation after validation."""
@@ -83,6 +85,30 @@ class ContentCapturePolicy(StrictConfigModel):
     redact_patterns: tuple[str, ...] = ()
 
 
+class IngestionPolicy(StrictConfigModel):
+    """版本化的文档处理策略，任务提交后会完整复制该快照。"""
+
+    strategy_version: str = Field(default="ingestion-v1", min_length=1, max_length=80)
+    chunk_size: int = Field(default=512, ge=32, le=8192)
+    chunk_overlap: int = Field(default=64, ge=0, le=2048)
+    ocr_mode: Literal["disabled", "best_effort", "required"] = "disabled"
+    ocr_min_text_chars: int = Field(default=32, ge=0, le=100_000)
+    ocr_provider_id: str | None = Field(default=None, min_length=1, max_length=120)
+    ocr_max_pages: int = Field(default=100, ge=1, le=10_000)
+    ocr_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    ocr_concurrency: int = Field(default=2, ge=1, le=32)
+    max_chunks: int = Field(default=100_000, ge=1, le=1_000_000)
+
+    @model_validator(mode="after")
+    def overlap_must_fit_chunk(self) -> IngestionPolicy:
+        """防止重叠大于切分窗口导致无限循环或空分块。"""
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if self.ocr_mode == "required" and not self.ocr_provider_id:
+            raise ValueError("required OCR mode needs an OCR provider")
+        return self
+
+
 class TenantConfiguration(StrictConfigModel):
     """Fully resolved tenant policy snapshot persisted as an immutable version."""
 
@@ -94,6 +120,7 @@ class TenantConfiguration(StrictConfigModel):
     quotas: DurableQuotas = Field(default_factory=DurableQuotas)
     rates: RatePolicy = Field(default_factory=RatePolicy)
     concurrency: ConcurrencyPolicy = Field(default_factory=ConcurrencyPolicy)
+    ingestion: IngestionPolicy = Field(default_factory=IngestionPolicy)
     feature_flags: dict[str, bool] = Field(default_factory=dict)
     provider_policy: ProviderPolicy = Field(default_factory=ProviderPolicy)
     content_capture: ContentCapturePolicy = Field(default_factory=ContentCapturePolicy)
@@ -147,3 +174,18 @@ class TenantConfiguration(StrictConfigModel):
 def default_tenant_configuration() -> TenantConfiguration:
     """Return the complete version-one configuration used for new tenants."""
     return TenantConfiguration()
+
+
+def ingestion_processing_snapshot(
+    configuration: TenantConfiguration,
+    configuration_version_id: str | None,
+) -> dict[str, Any]:
+    """返回可持久化、稳定哈希且不含秘密的入库处理快照。"""
+    policy = configuration.ingestion.model_dump(mode="json")
+    return {
+        "schema_version": configuration.schema_version,
+        "configuration_version_id": configuration_version_id,
+        "strategy_version": configuration.ingestion.strategy_version,
+        "policy": policy,
+        "policy_hash": stable_json_hash(policy),
+    }

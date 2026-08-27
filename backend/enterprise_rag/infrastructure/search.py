@@ -7,7 +7,7 @@ import json
 import math
 import re
 import uuid
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -16,7 +16,7 @@ from enterprise_rag.application.ports import (
     IndexDocument,
     RetrievalCandidate,
 )
-from enterprise_rag.domain.types import AuthorizationScope, stable_hash
+from enterprise_rag.domain.types import AuthorizationScope, stable_hash, stable_json_hash
 
 
 def _tokens(text: str) -> set[str]:
@@ -78,6 +78,7 @@ class _MemorySearchBase:
         """初始化内存文档、活动版本和 ACL 版本索引。"""
         self._documents: dict[str, IndexDocument] = {}
         self._active_versions_by_document: dict[str, str] = {}
+        self._active_generations_by_document: dict[str, str] = {}
         self._acl_epochs: dict[str, int] = {}
 
     async def stage(self, documents: Sequence[IndexDocument]) -> None:
@@ -100,14 +101,87 @@ class _MemorySearchBase:
         self._active_versions_by_document[str(document.metadata["document_id"])] = (
             document_version_id
         )
+        generation_id = document.metadata.get("index_generation_id")
+        if generation_id:
+            self._active_generations_by_document[str(document.metadata["document_id"])] = str(
+                generation_id
+            )
+
+    async def publish_generation(
+        self, document_version_id: str, index_generation_id: str
+    ) -> None:
+        """仅把指定内容版本的指定处理代次切换为活动投影。"""
+        document = next(
+            (
+                item
+                for item in self._documents.values()
+                if item.metadata.get("document_version_id") == document_version_id
+                and str(item.metadata.get("index_generation_id")) == index_generation_id
+            ),
+            None,
+        )
+        if document is None:
+            raise RuntimeError("cannot publish an empty staged index generation")
+        document_id = str(document.metadata["document_id"])
+        self._active_versions_by_document[document_id] = document_version_id
+        self._active_generations_by_document[document_id] = index_generation_id
 
     async def delete_document(self, document_id: str) -> None:
         """删除文档的活动指针和全部内存分块。"""
         self._active_versions_by_document.pop(document_id, None)
+        self._active_generations_by_document.pop(document_id, None)
         self._documents = {
             key: value
             for key, value in self._documents.items()
             if value.metadata.get("document_id") != document_id
+        }
+
+    async def delete_generation(self, document_id: str, index_generation_id: str) -> None:
+        """删除指定文档的非活动处理代次，保留其他代次供回滚。"""
+        self._documents = {
+            key: value
+            for key, value in self._documents.items()
+            if not (
+                str(value.metadata.get("document_id")) == document_id
+                and str(value.metadata.get("index_generation_id")) == index_generation_id
+            )
+        }
+
+    async def inspect_generation(
+        self, document_id: str, index_generation_id: str
+    ) -> dict[str, object]:
+        """返回不含正文的代次数量和关键 metadata 指纹。"""
+        documents = [
+            item
+            for item in self._documents.values()
+            if str(item.metadata.get("document_id")) == document_id
+            and str(item.metadata.get("index_generation_id")) == index_generation_id
+        ]
+        signatures = [
+            {
+                key: item.metadata.get(key)
+                for key in (
+                    "tenant_id",
+                    "knowledge_space_id",
+                    "document_id",
+                    "document_version_id",
+                    "index_generation_id",
+                    "acl_epoch",
+                    "acl_tokens",
+                )
+            }
+            for item in documents
+        ]
+        return {
+            "count": len(documents),
+            "metadata_hash": stable_json_hash(
+                {"items": sorted(signatures, key=lambda item: str(item))}
+            ),
+            "published_count": sum(
+                self._active_generations_by_document.get(document_id)
+                == str(item.metadata.get("index_generation_id"))
+                for item in documents
+            ),
         }
 
     def set_acl_epoch(self, tenant_id: str, epoch: int) -> None:
@@ -121,11 +195,22 @@ class _MemorySearchBase:
         if scope.acl_epoch != current_epoch:
             raise PermissionError("authorization scope is stale")
         acl_tokens = set(metadata.get("acl_tokens", []))
+        active_generation = self._active_generations_by_document.get(
+            str(metadata.get("document_id"))
+        )
         return bool(
             metadata.get("tenant_id") == scope.tenant_id
             and metadata.get("knowledge_space_id") in scope.knowledge_space_ids
             and metadata.get("document_version_id")
             == self._active_versions_by_document.get(str(metadata.get("document_id")))
+            and (
+                active_generation is None
+                or str(metadata.get("index_generation_id")) == active_generation
+            )
+            and (
+                not scope.index_generation_ids
+                or str(metadata.get("index_generation_id")) in scope.index_generation_ids
+            )
             and (
                 not scope.document_ids
                 or metadata.get("document_id") in scope.document_ids
@@ -228,6 +313,30 @@ class _RemoteSearchBase:
         if scope.acl_epoch != current_epoch:
             raise PermissionError("authorization scope is stale")
 
+    @staticmethod
+    def _metadata_signature(source: Mapping[str, Any]) -> dict[str, object]:
+        """Extract reconciliation metadata without retaining indexed document text."""
+        nested = source.get("metadata")
+        metadata = nested if isinstance(nested, Mapping) else source
+        return {
+            key: metadata.get(key, source.get(key))
+            for key in (
+                "tenant_id",
+                "knowledge_space_id",
+                "document_id",
+                "document_version_id",
+                "index_generation_id",
+                "acl_epoch",
+                "acl_tokens",
+            )
+        }
+
+    @classmethod
+    def _metadata_hash(cls, rows: Sequence[Mapping[str, Any]]) -> str:
+        """Compute the same stable metadata fingerprint as PostgreSQL reconciliation."""
+        signatures = [cls._metadata_signature(row) for row in rows]
+        return stable_json_hash({"items": sorted(signatures, key=lambda item: str(item))})
+
 
 class QdrantVectorSearch(_RemoteSearchBase):
     """Qdrant 稠密检索适配器，索引查询始终带租户和 ACL 过滤器。"""
@@ -297,12 +406,17 @@ class QdrantVectorSearch(_RemoteSearchBase):
         """构造 Qdrant payload 精确匹配条件。"""
         return {"key": key, "match": {"value": value}}
 
-    async def _version_document_id(self, document_version_id: str) -> str:
+    async def _version_document_id(
+        self, document_version_id: str, index_generation_id: str | None = None
+    ) -> str:
         """从已暂存版本中找到文档 ID，防止发布空版本。"""
+        must = [self._match("document_version_id", document_version_id)]
+        if index_generation_id is not None:
+            must.append(self._match("index_generation_id", index_generation_id))
         response = await self._client.post(
             f"/collections/{self.collection}/points/scroll",
             json={
-                "filter": {"must": [self._match("document_version_id", document_version_id)]},
+                "filter": {"must": must},
                 "limit": 1,
                 "with_payload": True,
                 "with_vector": False,
@@ -331,12 +445,90 @@ class QdrantVectorSearch(_RemoteSearchBase):
             [self._match("document_version_id", document_version_id)], True
         )
 
+    async def publish_generation(
+        self, document_version_id: str, index_generation_id: str
+    ) -> None:
+        """只发布指定内容版本的处理代次。"""
+        document_id = await self._version_document_id(document_version_id, index_generation_id)
+        await self._set_published([self._match("document_id", document_id)], False)
+        await self._set_published(
+            [
+                self._match("document_version_id", document_version_id),
+                self._match("index_generation_id", index_generation_id),
+            ],
+            True,
+        )
+
+    async def inspect_generation(
+        self, document_id: str, index_generation_id: str
+    ) -> dict[str, object]:
+        """Count a generation and fingerprint metadata without reading indexed text."""
+        points: list[dict[str, Any]] = []
+        offset: object | None = None
+        while True:
+            payload: dict[str, object] = {
+                "filter": {
+                    "must": [
+                        self._match("document_id", document_id),
+                        self._match("index_generation_id", index_generation_id),
+                    ]
+                },
+                "limit": 10_000,
+                "with_payload": [
+                    "tenant_id",
+                    "knowledge_space_id",
+                    "document_id",
+                    "document_version_id",
+                    "index_generation_id",
+                    "acl_epoch",
+                    "acl_tokens",
+                    "published",
+                ],
+                "with_vector": False,
+            }
+            if offset is not None:
+                payload["offset"] = offset
+            response = await self._client.post(
+                f"/collections/{self.collection}/points/scroll", json=payload
+            )
+            response.raise_for_status()
+            result = response.json().get("result", {})
+            batch = result.get("points", []) if isinstance(result, dict) else []
+            for point in batch if isinstance(batch, list) else []:
+                if isinstance(point, dict):
+                    points.append(dict(point.get("payload") or {}))
+            next_offset = result.get("next_page_offset") if isinstance(result, dict) else None
+            if not batch or next_offset is None or next_offset == offset:
+                break
+            offset = next_offset
+        return {
+            "count": len(points),
+            "metadata_hash": self._metadata_hash(points),
+            "published_count": sum(bool(item.get("published")) for item in points),
+        }
+
     async def delete_document(self, document_id: str) -> None:
         """删除 Qdrant 中属于指定文档的全部点。"""
         response = await self._client.post(
             f"/collections/{self.collection}/points/delete",
             params={"wait": "true"},
             json={"filter": {"must": [self._match("document_id", document_id)]}},
+        )
+        response.raise_for_status()
+
+    async def delete_generation(self, document_id: str, index_generation_id: str) -> None:
+        """删除 Qdrant 中指定非活动处理代次的向量点。"""
+        response = await self._client.post(
+            f"/collections/{self.collection}/points/delete",
+            params={"wait": "true"},
+            json={
+                "filter": {
+                    "must": [
+                        self._match("document_id", document_id),
+                        self._match("index_generation_id", index_generation_id),
+                    ]
+                }
+            },
         )
         response.raise_for_status()
 
@@ -354,6 +546,13 @@ class QdrantVectorSearch(_RemoteSearchBase):
         if scope.document_ids:
             must.append(
                 {"key": "document_id", "match": {"any": sorted(scope.document_ids)}}
+            )
+        if scope.index_generation_ids:
+            must.append(
+                {
+                    "key": "index_generation_id",
+                    "match": {"any": sorted(scope.index_generation_ids)},
+                }
             )
         vector = (await self.embedding.embed([query]))[0]
         response = await self._client.post(
@@ -466,6 +665,10 @@ class MilvusVectorSearch(_RemoteSearchBase):
             expressions.append(f"published == {'true' if published else 'false'}")
         if document_ids:
             expressions.append(cls._in_expression("document_id", sorted(document_ids)))
+        if scope.index_generation_ids:
+            expressions.append(
+                cls._in_expression("index_generation_id", sorted(scope.index_generation_ids))
+            )
         return " && ".join(expressions)
 
     def _schema(self) -> Any:
@@ -498,6 +701,11 @@ class MilvusVectorSearch(_RemoteSearchBase):
         schema.add_field(field_name="document_id", datatype=DataType.VARCHAR, max_length=512)
         schema.add_field(
             field_name="document_version_id",
+            datatype=DataType.VARCHAR,
+            max_length=512,
+        )
+        schema.add_field(
+            field_name="index_generation_id",
             datatype=DataType.VARCHAR,
             max_length=512,
         )
@@ -543,6 +751,7 @@ class MilvusVectorSearch(_RemoteSearchBase):
             "knowledge_space_id": str(metadata["knowledge_space_id"]),
             "document_id": str(metadata["document_id"]),
             "document_version_id": str(metadata["document_version_id"]),
+            "index_generation_id": str(metadata.get("index_generation_id", "")),
             "acl_tokens": acl_tokens,
             "published": False,
             "metadata": metadata,
@@ -604,9 +813,56 @@ class MilvusVectorSearch(_RemoteSearchBase):
         )
         await asyncio.to_thread(self._set_published_sync, version_expression, True)
 
+    async def publish_generation(
+        self, document_version_id: str, index_generation_id: str
+    ) -> None:
+        """只发布指定内容版本中的处理代次。"""
+        version_expression = (
+            f"document_version_id == {self._quote(document_version_id)} "
+            f"&& index_generation_id == {self._quote(index_generation_id)}"
+        )
+        rows = await asyncio.to_thread(self._query_all_sync, version_expression)
+        if not rows:
+            raise RuntimeError("cannot publish an empty staged index generation")
+        document_id = str(rows[0]["document_id"])
+        await asyncio.to_thread(
+            self._set_published_sync,
+            f"document_id == {self._quote(document_id)}",
+            False,
+        )
+        await asyncio.to_thread(self._set_published_sync, version_expression, True)
+
+    async def inspect_generation(
+        self, document_id: str, index_generation_id: str
+    ) -> dict[str, object]:
+        """Count a generation and fingerprint metadata without reading indexed text."""
+        expression = (
+            f"document_id == {self._quote(document_id)} "
+            f"&& index_generation_id == {self._quote(index_generation_id)}"
+        )
+        rows = await asyncio.to_thread(self._query_all_sync, expression)
+        return {
+            "count": len(rows),
+            "metadata_hash": self._metadata_hash(rows),
+            "published_count": sum(bool(row.get("published")) for row in rows),
+        }
+
     async def delete_document(self, document_id: str) -> None:
         """删除 Milvus 中属于指定文档的全部实体。"""
         expression = f"document_id == {self._quote(document_id)}"
+        await asyncio.to_thread(
+            self._client_or_raise().delete,
+            collection_name=self.collection,
+            filter=expression,
+        )
+        await asyncio.to_thread(self._flush_sync)
+
+    async def delete_generation(self, document_id: str, index_generation_id: str) -> None:
+        """删除 Milvus 中指定非活动处理代次的实体。"""
+        expression = (
+            f"document_id == {self._quote(document_id)} "
+            f"&& index_generation_id == {self._quote(index_generation_id)}"
+        )
         await asyncio.to_thread(
             self._client_or_raise().delete,
             collection_name=self.collection,
@@ -698,6 +954,7 @@ class OpenSearchLexicalSearch(_RemoteSearchBase):
                         "knowledge_space_id": {"type": "keyword"},
                         "document_id": {"type": "keyword"},
                         "document_version_id": {"type": "keyword"},
+                        "index_generation_id": {"type": "keyword"},
                         "acl_tokens": {"type": "keyword"},
                         "published": {"type": "boolean"},
                     }
@@ -769,12 +1026,116 @@ class OpenSearchLexicalSearch(_RemoteSearchBase):
             {"term": {"document_version_id": document_version_id}}, True
         )
 
+    async def publish_generation(
+        self, document_version_id: str, index_generation_id: str
+    ) -> None:
+        """只发布指定内容版本中的处理代次。"""
+        lookup = await self._client.post(
+            f"/{self.index}/_search",
+            json={
+                "size": 1,
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_version_id": document_version_id}},
+                            {"term": {"index_generation_id": index_generation_id}},
+                        ]
+                    }
+                },
+                "_source": ["document_id"],
+            },
+        )
+        lookup.raise_for_status()
+        hits = lookup.json().get("hits", {}).get("hits", [])
+        if not hits:
+            raise RuntimeError("cannot publish an empty staged index generation")
+        document_id = str(hits[0]["_source"]["document_id"])
+        await self._update_published({"term": {"document_id": document_id}}, False)
+        await self._update_published(
+            {
+                "bool": {
+                    "filter": [
+                        {"term": {"document_version_id": document_version_id}},
+                        {"term": {"index_generation_id": index_generation_id}},
+                    ]
+                }
+            },
+            True,
+        )
+
+    async def inspect_generation(
+        self, document_id: str, index_generation_id: str
+    ) -> dict[str, object]:
+        """Count a generation and fingerprint metadata without reading indexed text."""
+        response = await self._client.post(
+            f"/{self.index}/_search",
+            json={
+                "size": 10_000,
+                "track_total_hits": True,
+                "_source": [
+                    "tenant_id",
+                    "knowledge_space_id",
+                    "document_id",
+                    "document_version_id",
+                    "index_generation_id",
+                    "acl_epoch",
+                    "acl_tokens",
+                    "published",
+                ],
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_id": document_id}},
+                            {"term": {"index_generation_id": index_generation_id}},
+                        ]
+                    }
+                },
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        hits_payload = payload.get("hits", {})
+        hits = hits_payload.get("hits", []) if isinstance(hits_payload, dict) else []
+        rows = [
+            dict(hit.get("_source") or {})
+            for hit in hits
+            if isinstance(hit, dict)
+        ]
+        total_payload = hits_payload.get("total") if isinstance(hits_payload, dict) else None
+        if isinstance(total_payload, dict):
+            total = int(total_payload.get("value", len(rows)))
+        else:
+            total = int(total_payload) if isinstance(total_payload, int) else len(rows)
+        return {
+            "count": total,
+            "metadata_hash": self._metadata_hash(rows),
+            "published_count": sum(bool(row.get("published")) for row in rows),
+        }
+
     async def delete_document(self, document_id: str) -> None:
         """按文档 ID 删除 OpenSearch 中的全部索引记录。"""
         response = await self._client.post(
             f"/{self.index}/_delete_by_query",
             params={"refresh": "true", "conflicts": "proceed"},
             json={"query": {"term": {"document_id": document_id}}},
+        )
+        response.raise_for_status()
+
+    async def delete_generation(self, document_id: str, index_generation_id: str) -> None:
+        """删除 OpenSearch 中指定非活动处理代次的索引记录。"""
+        response = await self._client.post(
+            f"/{self.index}/_delete_by_query",
+            params={"refresh": "true", "conflicts": "proceed"},
+            json={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_id": document_id}},
+                            {"term": {"index_generation_id": index_generation_id}},
+                        ]
+                    }
+                }
+            },
         )
         response.raise_for_status()
 
@@ -791,6 +1152,10 @@ class OpenSearchLexicalSearch(_RemoteSearchBase):
         ]
         if scope.document_ids:
             filters.append({"terms": {"document_id": sorted(scope.document_ids)}})
+        if scope.index_generation_ids:
+            filters.append(
+                {"terms": {"index_generation_id": sorted(scope.index_generation_ids)}}
+            )
         response = await self._client.post(
             f"/{self.index}/_search",
             json={

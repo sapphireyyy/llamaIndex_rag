@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from enterprise_rag.application.retrieval import (
+    DEFAULT_RETRIEVAL_POLICY_CONFIG,
+    DEFAULT_RETRIEVAL_POLICY_ID,
+    DEFAULT_RETRIEVAL_POLICY_VERSION,
+)
 from enterprise_rag.domain.tenant_config import default_tenant_configuration
 from enterprise_rag.domain.types import QuotaResource, Role, new_id, stable_json_hash, utc_now
 from enterprise_rag.infrastructure.orm import (
@@ -15,6 +20,7 @@ from enterprise_rag.infrastructure.orm import (
     DocumentVersionRecord,
     GroupRecord,
     KnowledgeSpaceRecord,
+    PolicyVersionRecord,
     PrincipalRecord,
     TenantConfigurationVersionRecord,
     TenantMembershipRecord,
@@ -141,6 +147,27 @@ async def ensure_tenant_control_plane(
         session.add(active_config)
         report.configurations_created += 1
     tenant.active_config_version_id = active_config.id
+
+    default_policy = await session.scalar(
+        select(PolicyVersionRecord).where(
+            PolicyVersionRecord.tenant_id == tenant.id,
+            PolicyVersionRecord.policy_id == DEFAULT_RETRIEVAL_POLICY_ID,
+            PolicyVersionRecord.version == DEFAULT_RETRIEVAL_POLICY_VERSION,
+        )
+    )
+    if default_policy is None:
+        session.add(
+            PolicyVersionRecord(
+                id=new_id("policy_version"),
+                tenant_id=tenant.id,
+                policy_id=DEFAULT_RETRIEVAL_POLICY_ID,
+                kind="retrieval",
+                version=DEFAULT_RETRIEVAL_POLICY_VERSION,
+                state="active",
+                config=dict(DEFAULT_RETRIEVAL_POLICY_CONFIG),
+                content_hash=stable_json_hash(DEFAULT_RETRIEVAL_POLICY_CONFIG),
+            )
+        )
 
     calculated = await calculate_tenant_usage(session, tenant.id)
     now = utc_now()

@@ -237,6 +237,7 @@ class AuthorizationScope:
     document_ids: frozenset[str] = frozenset()
     configuration_version_id: str | None = None
     resource_versions: tuple[str, ...] = ()
+    index_generation_ids: tuple[str, ...] = ()
     policy_versions: tuple[str, ...] = ()
 
     def cache_key(self, assistant_version_id: str) -> str:
@@ -250,6 +251,7 @@ class AuthorizationScope:
             "assistant_version": assistant_version_id,
             "configuration_version": self.configuration_version_id,
             "resource_versions": sorted(self.resource_versions),
+            "index_generation_ids": sorted(self.index_generation_ids),
             "policy_versions": sorted(self.policy_versions),
         }
         return stable_json_hash(payload)

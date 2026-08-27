@@ -338,6 +338,9 @@ class DocumentRecord(TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     state: Mapped[str] = mapped_column(String(30), default="active", nullable=False, index=True)
     active_version_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    active_generation_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, index=True
+    )
     acl_tokens: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     acl_epoch: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -359,11 +362,42 @@ class DocumentVersionRecord(TimestampMixin, Base):
     source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class IndexGenerationRecord(TimestampMixin, Base):
+    """文档内容的可回滚索引处理代次及其外部投影状态。"""
+
+    __tablename__ = "index_generations"
+    __table_args__ = (
+        UniqueConstraint("document_id", "generation_number"),
+        Index("ix_index_generations_document_state", "document_id", "state"),
+    )
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id"), index=True
+    )
+    generation_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    processing_config_version_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    processing_strategy_version: Mapped[str] = mapped_column(
+        String(80), default="ingestion-v1", nullable=False
+    )
+    processing_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    component_versions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    reason: Mapped[str] = mapped_column(String(80), default="upload", nullable=False)
+    state: Mapped[str] = mapped_column(String(30), default="staging", nullable=False, index=True)
+    dense_state: Mapped[str] = mapped_column(String(30), default="pending", nullable=False)
+    lexical_state: Mapped[str] = mapped_column(String(30), default="pending", nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(512))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ChunkRecord(TimestampMixin, Base):
     """文档版本切分出的检索分块及 ACL 快照。"""
 
     __tablename__ = "chunks"
-    __table_args__ = (UniqueConstraint("document_version_id", "ordinal"),)
+    __table_args__ = (UniqueConstraint("index_generation_id", "ordinal"),)
     id: Mapped[str] = mapped_column(String(120), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     knowledge_space_id: Mapped[str] = mapped_column(
@@ -372,6 +406,9 @@ class ChunkRecord(TimestampMixin, Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
     document_version_id: Mapped[str] = mapped_column(
         ForeignKey("document_versions.id"), index=True
+    )
+    index_generation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("index_generations.id"), index=True
     )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -402,6 +439,12 @@ class IngestionJobRecord(TimestampMixin, Base):
     error_category: Mapped[str | None] = mapped_column(String(80))
     error_message: Mapped[str | None] = mapped_column(String(512))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    claimed_by: Mapped[str | None] = mapped_column(String(120), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    processing_config_version_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    processing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class JobAttemptRecord(Base):
@@ -423,7 +466,7 @@ class PolicyVersionRecord(TimestampMixin, Base):
     """策略配置的不可变版本记录。"""
 
     __tablename__ = "policy_versions"
-    __table_args__ = (UniqueConstraint("policy_id", "version"),)
+    __table_args__ = (UniqueConstraint("tenant_id", "policy_id", "version"),)
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     policy_id: Mapped[str] = mapped_column(String(80), index=True)
@@ -490,6 +533,8 @@ class ProviderProfileRecord(TimestampMixin, Base):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     secret_binding_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    profile_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    profile_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
 
 
 class ConversationRecord(TimestampMixin, Base):
@@ -528,6 +573,9 @@ class QueryExecutionRecord(TimestampMixin, Base):
     question: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="running", nullable=False)
     component_versions: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+    delivery_mode: Mapped[str] = mapped_column(String(30), default="buffered", nullable=False)
+    policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     trace: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
@@ -709,6 +757,9 @@ class OutboxRecord(Base):
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     poisoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(120), index=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

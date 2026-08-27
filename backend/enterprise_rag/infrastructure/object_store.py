@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import boto3  # type: ignore[import-untyped]
 from botocore.config import Config  # type: ignore[import-untyped]
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+from enterprise_rag.application.ports import ObjectStoreEntry
 
 
 def tenant_object_key(tenant_id: str, category: str, object_id: str, name: str) -> str:
@@ -62,6 +65,26 @@ class FileSystemObjectStore:
     async def health(self) -> bool:
         """通过检查根目录判断本地存储是否就绪。"""
         return await asyncio.to_thread(self.root.exists)
+
+    async def list_objects(self, prefix: str = "") -> list[ObjectStoreEntry]:
+        """按前缀列出本地对象，清单读取不会越过存储根目录。"""
+        root = self._resolve(prefix) if prefix else self.root
+
+        def collect() -> list[ObjectStoreEntry]:
+            if not root.exists():
+                return []
+            entries: list[ObjectStoreEntry] = []
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if self.root not in resolved.parents:
+                    continue
+                modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                entries.append(ObjectStoreEntry(path.relative_to(self.root).as_posix(), modified))
+            return entries
+
+        return await asyncio.to_thread(collect)
 
 
 class S3ObjectStore:
@@ -142,3 +165,16 @@ class S3ObjectStore:
             return True
         except Exception:
             return False
+
+    async def list_objects(self, prefix: str = "") -> list[ObjectStoreEntry]:
+        """分页读取 S3 清单，供保留期清理任务识别孤儿对象。"""
+        def collect() -> list[ObjectStoreEntry]:
+            paginator = self._client.get_paginator("list_objects_v2")
+            entries: list[ObjectStoreEntry] = []
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for item in page.get("Contents", []):
+                    modified = item.get("LastModified") or datetime.now(UTC)
+                    entries.append(ObjectStoreEntry(str(item["Key"]), modified))
+            return entries
+
+        return await asyncio.to_thread(collect)

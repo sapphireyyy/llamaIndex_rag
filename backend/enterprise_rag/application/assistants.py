@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from enterprise_rag.api.errors import AppError
 from enterprise_rag.application.audit import AuditEventInput, AuditService
 from enterprise_rag.application.providers import AdapterRegistry
+from enterprise_rag.application.retrieval import DEFAULT_RETRIEVAL_POLICY_ID
 from enterprise_rag.domain.types import (
     ErrorCategory,
     RequestIdentity,
@@ -40,10 +41,16 @@ class AssistantDraft:
 class AssistantService:
     """负责助手草稿校验、版本历史和活动版本切换。"""
 
-    def __init__(self, session: AsyncSession, registry: AdapterRegistry) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        registry: AdapterRegistry,
+        environment: str = "development",
+    ) -> None:
         """保存数据库会话和适配器注册表，供版本校验与发布使用。"""
         self.session = session
         self.registry = registry
+        self.environment = environment
 
     @staticmethod
     def _require_admin(identity: RequestIdentity) -> None:
@@ -85,9 +92,21 @@ class AssistantService:
             )
             or 0
         ) + 1
+        policy_version_ids = dict(draft.policy_version_ids)
+        if "retrieval" not in policy_version_ids:
+            default_policy = await self.session.scalar(
+                select(PolicyVersionRecord).where(
+                    PolicyVersionRecord.tenant_id == identity.tenant_id,
+                    PolicyVersionRecord.policy_id == DEFAULT_RETRIEVAL_POLICY_ID,
+                    PolicyVersionRecord.kind == "retrieval",
+                    PolicyVersionRecord.state == "active",
+                ).order_by(PolicyVersionRecord.version.desc())
+            )
+            if default_policy is not None:
+                policy_version_ids["retrieval"] = default_policy.id
         config = {
             "spaces": draft.knowledge_space_ids,
-            "policies": draft.policy_version_ids,
+            "policies": policy_version_ids,
             "providers": draft.provider_profile_ids,
         }
         version = AssistantVersionRecord(
@@ -96,7 +115,7 @@ class AssistantService:
             assistant_id=assistant_id,
             version=version_number,
             knowledge_space_ids=draft.knowledge_space_ids,
-            policy_version_ids=draft.policy_version_ids,
+            policy_version_ids=policy_version_ids,
             provider_profile_ids=draft.provider_profile_ids,
             config_hash=stable_json_hash(config),
         )
@@ -109,6 +128,8 @@ class AssistantService:
     ) -> list[str]:
         """检查空间、策略、供应商能力和密钥绑定是否可用于发布。"""
         errors: list[str] = []
+        if self.environment == "production" and "model" not in version.provider_profile_ids:
+            errors.append("production requires an explicit model provider profile")
         spaces = list(
             (
                 await self.session.scalars(
@@ -133,6 +154,15 @@ class AssistantService:
             if profile is None:
                 errors.append(f"provider profile {kind} is unavailable")
                 continue
+            if self.environment == "production" and profile.adapter == "extractive":
+                errors.append(f"provider {kind} cannot use extractive in production")
+            if (
+                self.environment == "production"
+                and profile.kind == "model"
+                and profile.adapter != "extractive"
+                and not profile.secret_binding_ids
+            ):
+                errors.append(f"provider {kind} requires a secret binding in production")
             descriptor = self.registry.describe(profile.kind, profile.adapter)
             if descriptor is None:
                 errors.append(f"provider adapter {profile.kind}/{profile.adapter} is unavailable")

@@ -10,8 +10,12 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.skipif(
-    not os.getenv("RAG_TEST_DATABASE_URL", "").startswith("postgresql"),
-    reason="PostgreSQL RLS suite requires RAG_TEST_DATABASE_URL",
+    not os.getenv("RAG_TEST_DATABASE_URL", "").startswith("postgresql")
+    or not os.getenv("RAG_TEST_RUNTIME_DATABASE_URL", "").startswith("postgresql"),
+    reason=(
+        "PostgreSQL RLS suite requires RAG_TEST_DATABASE_URL and "
+        "RAG_TEST_RUNTIME_DATABASE_URL"
+    ),
 )
 
 
@@ -47,22 +51,7 @@ async def test_postgres_rls_filters_identifiers_and_resets_pooled_context(
                 "WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), ''))"
             )
         )
-        await connection.execute(
-            text(
-                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
-                "'enterprise_rag_rls_test') THEN CREATE ROLE enterprise_rag_rls_test "
-                "LOGIN PASSWORD 'enterprise_rag_rls_test'; END IF; END $$"
-            )
-        )
-        await connection.execute(text("GRANT USAGE ON SCHEMA public TO enterprise_rag_rls_test"))
-        await connection.execute(
-            text("GRANT SELECT ON knowledge_spaces TO enterprise_rag_rls_test")
-        )
-
-    runtime_engine = create_runtime_engine(
-        "postgresql+asyncpg://enterprise_rag_rls_test:enterprise_rag_rls_test"
-        "@localhost:5432/enterprise_rag_test"
-    )
+    runtime_engine = create_runtime_engine(os.environ["RAG_TEST_RUNTIME_DATABASE_URL"])
     runtime_sessions = async_sessionmaker(runtime_engine, expire_on_commit=False)
     try:
         async with tenant_session_scope(runtime_sessions, "tenant-a") as session:

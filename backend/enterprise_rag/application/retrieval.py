@@ -5,22 +5,56 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from opentelemetry import trace
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from enterprise_rag.api.errors import AppError
 from enterprise_rag.application.ports import RerankerAdapter, RetrievalCandidate, SearchAdapter
 from enterprise_rag.application.security import DatabaseAuthorizationService
-from enterprise_rag.domain.types import ErrorCategory, RequestIdentity, new_id, utc_now
+from enterprise_rag.domain.types import (
+    ErrorCategory,
+    RequestIdentity,
+    new_id,
+    stable_json_hash,
+    utc_now,
+)
 from enterprise_rag.infrastructure.orm import (
     ChunkRecord,
     DocumentRecord,
+    PolicyVersionRecord,
     TelemetryEventRecord,
 )
+
+DEFAULT_RETRIEVAL_POLICY_ID = "default-retrieval"
+DEFAULT_RETRIEVAL_POLICY_VERSION = 1
+DEFAULT_RETRIEVAL_POLICY_CONFIG: dict[str, object] = {
+    "dense_top_k": 20,
+    "lexical_top_k": 20,
+    "fusion_k": 60,
+    "rerank_top_k": 12,
+    "evidence_top_k": 6,
+    "relevance_threshold": 0.01,
+    "context_character_budget": 24_000,
+    "allow_single_search_degradation": True,
+}
+
+
+def _as_int(value: object) -> int:
+    """将策略配置中的有限标量转换为整数并保留错误边界。"""
+    if isinstance(value, (bool, int, float, str)):
+        return int(value)
+    raise ValueError("retrieval policy integer value is invalid")
+
+
+def _as_float(value: object) -> float:
+    """将策略配置中的有限标量转换为浮点数并保留错误边界。"""
+    if isinstance(value, (bool, int, float, str)):
+        return float(value)
+    raise ValueError("retrieval policy float value is invalid")
 
 
 def normalize_query(question: str) -> str:
@@ -52,6 +86,109 @@ class RetrievalPolicy:
     relevance_threshold: float = 0.01
     context_character_budget: int = 24_000
     allow_single_search_degradation: bool = True
+    policy_id: str = DEFAULT_RETRIEVAL_POLICY_ID
+    record_version: int = DEFAULT_RETRIEVAL_POLICY_VERSION
+    content_hash: str = ""
+    inherited_from: str | None = "versioned-default"
+
+    def __post_init__(self) -> None:
+        """为直接构造的兼容对象补齐可审计的有效哈希。"""
+        if not self.content_hash:
+            object.__setattr__(self, "content_hash", stable_json_hash(self.values()))
+        if self.dense_top_k <= 0 or self.lexical_top_k <= 0:
+            raise ValueError("retrieval top-k values must be positive")
+        if self.fusion_k <= 0 or self.rerank_top_k <= 0 or self.evidence_top_k <= 0:
+            raise ValueError("retrieval ranking values must be positive")
+        if self.context_character_budget <= 0:
+            raise ValueError("retrieval context budget must be positive")
+        if self.relevance_threshold < 0:
+            raise ValueError("retrieval relevance threshold must not be negative")
+
+    def values(self) -> dict[str, object]:
+        """返回所有检索阶段实际使用的参数，不包含身份元数据。"""
+        return {
+            "dense_top_k": self.dense_top_k,
+            "lexical_top_k": self.lexical_top_k,
+            "fusion_k": self.fusion_k,
+            "rerank_top_k": self.rerank_top_k,
+            "evidence_top_k": self.evidence_top_k,
+            "relevance_threshold": self.relevance_threshold,
+            "context_character_budget": self.context_character_budget,
+            "allow_single_search_degradation": self.allow_single_search_degradation,
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        """返回查询记录中冻结的策略 ID、版本、哈希、来源和最终值。"""
+        return {
+            "schema_version": 1,
+            "policy_id": self.policy_id,
+            "version": self.record_version,
+            "version_label": self.version,
+            "content_hash": self.content_hash,
+            "effective_hash": stable_json_hash(self.values()),
+            "inherited_from": self.inherited_from,
+            "values": self.values(),
+        }
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, object],
+        *,
+        policy_id: str,
+        record_version: int,
+        content_hash: str,
+    ) -> RetrievalPolicy:
+        """从持久化配置解析完整策略，并为缺失字段记录版本化继承来源。"""
+        values = dict(DEFAULT_RETRIEVAL_POLICY_CONFIG)
+        if "top_k" in config:
+            values["dense_top_k"] = config["top_k"]
+            values["lexical_top_k"] = config["top_k"]
+        for key in values:
+            if key in config:
+                values[key] = config[key]
+        inherited = (
+            "versioned-default"
+            if any(key not in config for key in DEFAULT_RETRIEVAL_POLICY_CONFIG)
+            else None
+        )
+        try:
+            dense_top_k = _as_int(values["dense_top_k"])
+            lexical_top_k = _as_int(values["lexical_top_k"])
+            fusion_k = _as_int(values["fusion_k"])
+            rerank_top_k = _as_int(values["rerank_top_k"])
+            evidence_top_k = _as_int(values["evidence_top_k"])
+            relevance_threshold = _as_float(values["relevance_threshold"])
+            context_character_budget = _as_int(values["context_character_budget"])
+            return cls(
+                version=f"{policy_id}:v{record_version}",
+                dense_top_k=dense_top_k,
+                lexical_top_k=lexical_top_k,
+                fusion_k=fusion_k,
+                rerank_top_k=rerank_top_k,
+                evidence_top_k=evidence_top_k,
+                relevance_threshold=relevance_threshold,
+                context_character_budget=context_character_budget,
+                allow_single_search_degradation=bool(
+                    values["allow_single_search_degradation"]
+                ),
+                policy_id=policy_id,
+                record_version=record_version,
+                content_hash=content_hash,
+                inherited_from=inherited,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("retrieval policy contains invalid values") from exc
+
+    @classmethod
+    def default(cls) -> RetrievalPolicy:
+        """构造与持久化 default-retrieval/v1 相同的兼容策略。"""
+        return cls.from_config(
+            DEFAULT_RETRIEVAL_POLICY_CONFIG,
+            policy_id=DEFAULT_RETRIEVAL_POLICY_ID,
+            record_version=DEFAULT_RETRIEVAL_POLICY_VERSION,
+            content_hash=stable_json_hash(DEFAULT_RETRIEVAL_POLICY_CONFIG),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,18 +317,25 @@ class RetrievalService:
                         ChunkRecord.active.is_(True),
                         DocumentRecord.state == "active",
                         ChunkRecord.document_version_id == DocumentRecord.active_version_id,
+                        or_(
+                            DocumentRecord.active_generation_id.is_(None),
+                            ChunkRecord.index_generation_id
+                            == DocumentRecord.active_generation_id,
+                        ),
                     )
                 )
             ).all()
             active_rows = {chunk.id: (chunk, document) for chunk, document in rows}
 
         rejected = 0
+        rejection_reasons: defaultdict[str, int] = defaultdict(int)
         validated_sets: list[list[RetrievalCandidate]] = []
         for result_set in successful:
             validated: list[RetrievalCandidate] = []
             for candidate in result_set:
                 metadata = candidate.metadata
                 row = active_rows.get(candidate.chunk_id)
+                reason = ""
                 allowed = bool(
                     row
                     and metadata.get("tenant_id") == identity.tenant_id
@@ -206,11 +350,45 @@ class RetrievalService:
                         not scope.document_ids
                         or row[0].document_id in scope.document_ids
                     )
+                    and (
+                        row[0].index_generation_id is None
+                        or str(metadata.get("index_generation_id"))
+                        == str(row[0].index_generation_id)
+                    )
+                    and (
+                        not scope.index_generation_ids
+                        or str(row[0].index_generation_id) in scope.index_generation_ids
+                    )
                 )
                 if allowed:
                     validated.append(candidate)
                 else:
                     rejected += 1
+                    if row is None:
+                        reason = "missing_or_inactive_authority_row"
+                    elif metadata.get("tenant_id") != identity.tenant_id:
+                        reason = "tenant_mismatch"
+                    elif metadata.get("document_version_id") != row[0].document_version_id:
+                        reason = "stale_document_version"
+                    elif (
+                        row[0].index_generation_id is not None
+                        and str(metadata.get("index_generation_id"))
+                        != str(row[0].index_generation_id)
+                    ):
+                        reason = "stale_index_generation"
+                    elif (
+                        scope.index_generation_ids
+                        and str(row[0].index_generation_id)
+                        not in scope.index_generation_ids
+                    ):
+                        reason = "unauthorized_index_generation"
+                    elif not set(metadata.get("acl_tokens", [])).intersection(
+                        scope.principal_tokens
+                    ):
+                        reason = "candidate_acl_mismatch"
+                    else:
+                        reason = "authority_or_scope_mismatch"
+                    rejection_reasons[reason] += 1
             validated_sets.append(validated)
         if rejected:
             span_context = trace.get_current_span().get_span_context()
@@ -266,5 +444,47 @@ class RetrievalService:
                 "evidence_count": len(evidence),
                 "scope_acl_epoch": scope.acl_epoch,
                 "foreign_candidates_rejected": rejected,
+                "stale_candidate_reasons": dict(rejection_reasons),
+                "policy_snapshot": policy.snapshot(),
             },
         )
+
+    async def resolve_policy(
+        self,
+        tenant_id: str,
+        policy_id: str | None,
+    ) -> RetrievalPolicy:
+        """解析租户活动策略；缺失或跨租户引用不会静默回退。"""
+        statement = select(PolicyVersionRecord).where(
+            PolicyVersionRecord.tenant_id == tenant_id,
+            PolicyVersionRecord.kind == "retrieval",
+            PolicyVersionRecord.state == "active",
+        )
+        if policy_id:
+            statement = statement.where(
+                PolicyVersionRecord.id == policy_id
+            )
+        else:
+            statement = statement.where(
+                PolicyVersionRecord.policy_id == DEFAULT_RETRIEVAL_POLICY_ID
+            ).order_by(PolicyVersionRecord.version.desc())
+        record = await self.session.scalar(statement)
+        if record is None:
+            raise AppError(
+                ErrorCategory.INVALID_REQUEST,
+                "Active retrieval policy is unavailable.",
+                422,
+            )
+        try:
+            return RetrievalPolicy.from_config(
+                record.config,
+                policy_id=record.policy_id,
+                record_version=record.version,
+                content_hash=record.content_hash,
+            )
+        except ValueError as exc:
+            raise AppError(
+                ErrorCategory.INVALID_REQUEST,
+                "Active retrieval policy is invalid.",
+                422,
+            ) from exc

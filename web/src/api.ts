@@ -21,6 +21,7 @@ export type DocumentItem = {
   state: string;
   knowledge_space_id: string;
   active_version_id: string | null;
+  active_generation_id?: string | null;
 };
 export type Job = {
   id: string;
@@ -31,6 +32,11 @@ export type Job = {
   attempt_count: number;
   max_attempts: number;
   error_message: string | null;
+  claimed_by?: string | null;
+  lease_expires_at?: string | null;
+  next_attempt_at?: string | null;
+  processing_config_version_id?: string | null;
+  processing_config_hash?: string | null;
 };
 export type Assistant = { id: string; name: string; active_version_id: string | null };
 export type AssistantVersion = {
@@ -38,6 +44,9 @@ export type AssistantVersion = {
   version: number;
   state: string;
   knowledge_space_ids: string[];
+  policy_version_ids: Record<string, string>;
+  provider_profile_ids: Record<string, string>;
+  config_hash: string;
   validation_errors: string[];
   activated_at: string | null;
 };
@@ -49,7 +58,15 @@ export type ProviderProfile = {
   capabilities: string[];
   secret_bindings: Array<{ id: string; name: string; valid: boolean }>;
 };
-export type Policy = { id: string; kind: string; version: number; state: string };
+export type Policy = {
+  id: string;
+  policy_id?: string;
+  kind: string;
+  version: number;
+  state: string;
+  config?: Record<string, unknown>;
+  content_hash?: string;
+};
 export type Citation = {
   id: string;
   label: string;
@@ -142,6 +159,25 @@ export type TenantUsage = {
   limit: number;
   revision: number;
   warning: boolean;
+};
+export type IndexGeneration = {
+  id: string;
+  document_version_id: string;
+  generation_number: number;
+  state: string;
+  active: boolean;
+  dense_state: string;
+  lexical_state: string;
+  chunk_count: number;
+  reason: string;
+  processing_config_version_id: string | null;
+  processing_strategy_version: string;
+  processing_config_hash: string;
+  component_versions: Record<string, unknown>;
+  last_error: string | null;
+  published_at: string | null;
+  superseded_at: string | null;
+  created_at: string;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -286,6 +322,22 @@ export const api = {
   jobs: () => request<{ items: Job[] }>("/api/v1/ingestion-jobs"),
   retryJob: (id: string) => request<Job>(`/api/v1/ingestion-jobs/${id}/retry`, { method: "POST" }),
   cancelJob: (id: string) => request<Job>(`/api/v1/ingestion-jobs/${id}/cancel`, { method: "POST" }),
+  rebuildDocument: (id: string, reason = "rebuild") => request<Job>(`/api/v1/documents/${id}/rebuild`, {
+    method: "POST", body: JSON.stringify({ reason }),
+  }),
+  rebuildDataSource: (id: string, reason = "source-rebuild") =>
+    request<{ items: Job[]; count: number }>(`/api/v1/data-sources/${id}/rebuild`, {
+      method: "POST", body: JSON.stringify({ reason }),
+    }),
+  rebuildKnowledgeSpace: (id: string, reason = "space-rebuild") =>
+    request<{ items: Job[]; count: number }>(`/api/v1/knowledge-spaces/${id}/rebuild`, {
+      method: "POST", body: JSON.stringify({ reason }),
+    }),
+  rollbackGeneration: (documentId: string, generationId: string, reason = "generation-rollback") =>
+    request<{ generation: IndexGeneration; reason: string }>(
+      `/api/v1/documents/${documentId}/generations/${generationId}/rollback`,
+      { method: "POST", body: JSON.stringify({ reason }) },
+    ),
   deleteDocument: (id: string) => request<void>(`/api/v1/documents/${id}`, { method: "DELETE" }),
   previewDocument: (id: string) =>
     request<{ items: Array<{ id: string; text: string; page: number | null; section: string | null }> }>(
@@ -294,9 +346,16 @@ export const api = {
   downloadDocument: (id: string, fallbackFilename: string) =>
     downloadProtectedResource(`/api/v1/documents/${id}/download`, fallbackFilename),
   documentVersions: (id: string) =>
-    request<{ items: Array<{ id: string; state: string; active: boolean; created_at: string }> }>(
-      `/api/v1/documents/${id}/versions`,
-    ),
+    request<{
+      items: Array<{
+        id: string;
+        state: string;
+        active: boolean;
+        active_generation_id: string | null;
+        generations: IndexGeneration[];
+        created_at: string;
+      }>;
+    }>(`/api/v1/documents/${id}/versions`),
   assistants: () => request<{ items: Assistant[] }>("/api/v1/assistants"),
   assistantHistory: (id: string) =>
     request<{ items: AssistantVersion[] }>(`/api/v1/assistants/${id}/versions`),
@@ -407,12 +466,18 @@ export async function streamQuery(
       buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
       const blocks = buffer.split("\n\n");
       buffer = blocks.pop() ?? "";
-      for (const block of blocks) {
+      const parseBlock = (block: string) => {
         const event = block.match(/^event: (.+)$/m)?.[1];
         const data = block.match(/^data: (.+)$/m)?.[1];
         if (event && data) onEvent(event, JSON.parse(data) as Record<string, unknown>);
-      }
+      };
+      blocks.forEach(parseBlock);
       if (done) break;
+    }
+    if (buffer.trim()) {
+      const event = buffer.match(/^event: (.+)$/m)?.[1];
+      const data = buffer.match(/^data: (.+)$/m)?.[1];
+      if (event && data) onEvent(event, JSON.parse(data) as Record<string, unknown>);
     }
   } finally {
     signal?.removeEventListener("abort", abortStream);

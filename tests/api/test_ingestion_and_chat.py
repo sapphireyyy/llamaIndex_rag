@@ -1,5 +1,6 @@
 import json
 
+from enterprise_rag.application.ingestion import IngestionService
 from fastapi.testclient import TestClient
 
 
@@ -84,8 +85,136 @@ def test_ingestion_unchanged_update_preview_and_delete(client: TestClient) -> No
     assert preview.status_code == 200
     assert "25 leave days" in preview.text
     assert "20 leave days" not in preview.text
+    versions = client.get(f"/api/v1/documents/{document_id}/versions")
+    assert versions.status_code == 200
+    first_generation = next(
+        generation
+        for version in versions.json()["items"]
+        if version["id"] == first_version
+        for generation in version["generations"]
+        if generation["state"] == "superseded"
+    )
+    rolled_back = client.post(
+        f"/api/v1/documents/{document_id}/generations/{first_generation['id']}/rollback",
+        json={"reason": "api-contract"},
+    )
+    assert rolled_back.status_code == 200
+    assert "20 leave days" in client.get(
+        f"/api/v1/documents/{document_id}/preview"
+    ).text
     assert client.delete(f"/api/v1/documents/{document_id}").status_code == 204
     assert client.get(f"/api/v1/documents/{document_id}/preview").status_code == 404
+
+
+def test_queued_upload_returns_before_processing(queued_client: TestClient, monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("queued upload must not process in the API request")
+
+    monkeypatch.setattr(IngestionService, "process_with_retries", fail_if_called)
+    _, source_id = _space_and_source(queued_client)
+    response = queued_client.post(
+        "/api/v1/documents/upload",
+        data={"source_id": source_id},
+        files={"file": ("queued.txt", b"Queued content", "text/plain")},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    queued_job = response.json()
+    assert queued_job["processing_config_version_id"]
+    assert queued_client.get(
+        f"/api/v1/ingestion-jobs/{response.json()['id']}"
+    ).json()["status"] == "queued"
+
+    effective = queued_client.get("/api/v1/tenant/settings/effective").json()
+    changed = effective["config"]
+    changed["ingestion"]["chunk_overlap"] = 32
+    activated = queued_client.post(
+        "/api/v1/tenant/settings/versions",
+        json={"config": changed, "activate": True},
+        headers={"If-Match": str(effective["tenant_revision"])},
+    )
+    assert activated.status_code == 201
+    frozen = queued_client.get(f"/api/v1/ingestion-jobs/{queued_job['id']}").json()
+    assert frozen["processing_config_version_id"] == queued_job["processing_config_version_id"]
+
+
+def test_same_content_rebuilds_when_processing_configuration_changes(client: TestClient) -> None:
+    """相同内容在切分策略变化后应复用版本并生成新的处理代次。"""
+    _, source_id = _space_and_source(client)
+    content = b"A stable document that must be reprocessed after the chunk policy changes."
+    first = client.post(
+        "/api/v1/documents/upload",
+        data={"source_id": source_id},
+        files={("file"): ("policy.txt", content, "text/plain")},
+    )
+    assert first.status_code == 202 and first.json()["status"] == "succeeded"
+    document_id = first.json()["document_id"]
+    version_id = first.json()["document_version_id"]
+
+    effective = client.get("/api/v1/tenant/settings/effective").json()
+    updated_config = effective["config"]
+    updated_config["ingestion"]["chunk_size"] = 256
+    activated = client.post(
+        "/api/v1/tenant/settings/versions",
+        json={"config": updated_config, "activate": True},
+        headers={"If-Match": str(effective["tenant_revision"])},
+    )
+    assert activated.status_code == 201, activated.text
+
+    second = client.post(
+        "/api/v1/documents/upload",
+        data={"source_id": source_id},
+        files={("file"): ("policy.txt", content, "text/plain")},
+    )
+    assert second.status_code == 202 and second.json()["status"] == "succeeded"
+    assert second.json()["document_version_id"] == version_id
+    assert second.json()["stage"] == "published"
+
+    versions = client.get(f"/api/v1/documents/{document_id}/versions").json()["items"]
+    generations = next(item["generations"] for item in versions if item["id"] == version_id)
+    assert len(generations) == 2
+    assert len({item["processing_config_hash"] for item in generations}) == 2
+
+
+def test_rebuild_can_target_source_and_space(client: TestClient) -> None:
+    """数据源、知识空间重建应复用普通队列且允许空空间返回零任务。"""
+    space_id, source_id = _space_and_source(client)
+    uploaded = client.post(
+        "/api/v1/documents/upload",
+        data={"source_id": source_id},
+        files={"file": ("rebuild.txt", b"Rebuild me", "text/plain")},
+    )
+    assert uploaded.status_code == 202
+    document_id = uploaded.json()["document_id"]
+
+    by_source = client.post(
+        f"/api/v1/data-sources/{source_id}/rebuild",
+        json={"reason": "source-policy-change"},
+    )
+    assert by_source.status_code == 202
+    assert by_source.json()["count"] == 1
+    assert by_source.json()["items"][0]["document_id"] == document_id
+    assert by_source.json()["items"][0]["status"] == "queued"
+
+    by_space = client.post(
+        f"/api/v1/knowledge-spaces/{space_id}/rebuild",
+        json={"reason": "space-policy-change"},
+    )
+    assert by_space.status_code == 202
+    assert by_space.json()["count"] == 1
+
+    empty_space = client.post(
+        "/api/v1/knowledge-spaces",
+        json={"name": "Empty space", "description": "No documents yet"},
+    )
+    assert empty_space.status_code == 201
+    empty_rebuild = client.post(
+        f"/api/v1/knowledge-spaces/{empty_space.json()['id']}/rebuild",
+        json={},
+    )
+    assert empty_rebuild.status_code == 202
+    assert empty_rebuild.json() == {"items": [], "count": 0}
 
 
 def test_upload_rejects_unsupported_and_malicious_content(client: TestClient) -> None:

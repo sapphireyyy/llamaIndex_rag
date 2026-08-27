@@ -1,10 +1,18 @@
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'enterprise_rag_app') THEN
-    CREATE ROLE enterprise_rag_app LOGIN PASSWORD 'enterprise_rag_app_dev';
+    CREATE ROLE enterprise_rag_app LOGIN;
   END IF;
 END
 $$;
+
+-- The wrapper passes the password through the PostgreSQL client variable
+-- `runtime_password`; no credential is stored in this SQL template.
+ALTER ROLE enterprise_rag_app PASSWORD :'runtime_password';
+
+-- The application account must never become a privileged role or table owner.
+ALTER ROLE enterprise_rag_app NOSUPERUSER NOBYPASSRLS NOINHERIT;
+REVOKE ALL ON DATABASE enterprise_rag FROM enterprise_rag_app;
 
 GRANT CONNECT ON DATABASE enterprise_rag TO enterprise_rag_app;
 GRANT USAGE ON SCHEMA public TO enterprise_rag_app;

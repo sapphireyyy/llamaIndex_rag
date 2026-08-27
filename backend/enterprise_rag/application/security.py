@@ -11,6 +11,7 @@ from enterprise_rag.api.errors import AppError
 from enterprise_rag.application.tenant_context import require_tenant_permission
 from enterprise_rag.domain.types import AuthorizationScope, ErrorCategory, RequestIdentity
 from enterprise_rag.infrastructure.orm import (
+    DocumentRecord,
     KnowledgeSpaceRecord,
     SpaceMembershipRecord,
     TenantRecord,
@@ -67,6 +68,24 @@ class DatabaseAuthorizationService:
                 .distinct()
             )
             allowed_spaces = frozenset((await session.scalars(statement)).all())
+            generation_ids = tuple(
+                sorted(
+                    {
+                        str(value)
+                        for value in (
+                            await session.scalars(
+                                select(DocumentRecord.active_generation_id).where(
+                                    DocumentRecord.tenant_id == identity.tenant_id,
+                                    DocumentRecord.knowledge_space_id.in_(allowed_spaces),
+                                    DocumentRecord.state == "active",
+                                    DocumentRecord.active_generation_id.is_not(None),
+                                )
+                            )
+                        ).all()
+                        if value is not None
+                    }
+                )
+            )
         if not allowed_spaces:
             raise AppError(ErrorCategory.FORBIDDEN, "No authorized knowledge space.", 403)
         return AuthorizationScope(
@@ -75,6 +94,7 @@ class DatabaseAuthorizationService:
             knowledge_space_ids=allowed_spaces,
             acl_epoch=identity.authorization_epoch or tenant.acl_epoch,
             configuration_version_id=identity.configuration_version_id,
+            index_generation_ids=generation_ids,
         )
 
 

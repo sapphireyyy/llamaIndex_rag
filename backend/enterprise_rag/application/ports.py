@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
 from enterprise_rag.domain.types import AuthorizationScope, JobMessage, RequestIdentity
@@ -60,6 +61,22 @@ class ObjectStore(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ObjectStoreEntry:
+    """对象清单中的键和最后修改时间。"""
+
+    key: str
+    last_modified: datetime
+
+
+class ObjectStoreInventory(Protocol):
+    """支持按租户前缀列出对象的可选对象存储能力。"""
+
+    async def list_objects(self, prefix: str = "") -> list[ObjectStoreEntry]:
+        """列出指定前缀下的对象及其最后修改时间。"""
+        ...
+
+
 class MessageQueue(Protocol):
     """异步任务消息发布和消费接口。"""
 
@@ -67,8 +84,22 @@ class MessageQueue(Protocol):
         """发布异步任务消息。"""
         ...
 
-    def consume(self) -> AsyncIterator[JobMessage]:
-        """返回持续消费任务消息的异步迭代器。"""
+    def consume(self) -> AsyncIterator[QueueDelivery]:
+        """返回持续消费 delivery；业务提交后由调用方显式确认。"""
+        ...
+
+
+class QueueDelivery(Protocol):
+    """跨队列实现统一的 ACK/NACK 生命周期。"""
+
+    message: JobMessage
+
+    async def ack(self) -> None:
+        """确认业务事务已提交。"""
+        ...
+
+    async def nack(self, *, requeue: bool = True) -> None:
+        """拒绝消息并选择是否重新入队。"""
         ...
 
 
@@ -124,6 +155,7 @@ class ParsedUnit:
     page: int | None
     section: str | None
     metadata: dict[str, Any]
+    page_image: bytes | None = None
 
 
 class ParserAdapter(Protocol):
@@ -133,6 +165,45 @@ class ParserAdapter(Protocol):
 
     async def parse(self, name: str, content: bytes) -> list[ParsedUnit]:
         """把文件内容解析为结构化文本单元。"""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class OCRRegion:
+    """OCR 识别出的文本区域及其置信度和坐标。"""
+
+    text: str
+    confidence: float
+    left: float
+    top: float
+    right: float
+    bottom: float
+    language: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OCRPageResult:
+    """单页 OCR 结果、Provider 版本和可审计诊断信息。"""
+
+    page: int
+    text: str
+    regions: tuple[OCRRegion, ...]
+    provider: str
+    version: str
+    confidence: float | None = None
+    elapsed_ms: float | None = None
+    error: str | None = None
+
+
+class OCRAdapter(Protocol):
+    """受租户策略约束的页面 OCR 能力。"""
+
+    capabilities: frozenset[str]
+    provider: str
+    version: str
+
+    async def recognize(self, page: ParsedUnit) -> OCRPageResult:
+        """识别一个含页面渲染输入的 ParsedUnit。"""
         ...
 
 
@@ -213,6 +284,16 @@ class ModelResponse:
     text: str
     usage: ModelUsage
     provider: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDelta:
+    """模型流中的增量、结束原因以及最终 usage。"""
+
+    text: str = ""
+    finish_reason: str | None = None
+    usage: ModelUsage | None = None
+    provider: str | None = None
 
 
 class ModelAdapter(Protocol):
